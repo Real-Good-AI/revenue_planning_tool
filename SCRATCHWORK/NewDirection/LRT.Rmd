@@ -1,0 +1,2254 @@
+---
+title: "LRT"
+author: "Mayleen"
+date: "2026-07-08"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Org-level
+
+First some pre-processing
+```{r}
+library(data.table)
+library(readr)
+library(dplyr)
+library(tidyverse)
+library(fields)
+library(mvtnorm)
+
+eligible_counties <- readRDS("top1counties.rds")
+df <- readRDS("county_long.rds") |> 
+      filter(TAX_YEAR < 2020) |> 
+      select(all_of(c("TAX_YEAR", "geoid_2010", "TOT_REV", "TOT_EXP", "TOT_ASSET", "county_full", "state_name", "REGION", "DIVISION", "TotDmgADJ", "n_disasters", "TotPerCapADJ", "FEMA_threshADJ")))
+
+top <- quantile(df$TotPerCapADJ, probs = c(0.99)) # will look for county,year pairs where the county had per capita damage in the top 1 percentile
+df <- df |> mutate(topDamage = TotPerCapADJ >= top) |> filter(geoid_2010 %in% eligible_counties)
+
+df.changes <- df |> filter(topDamage) |> select(geoid_2010,TAX_YEAR)
+tst <- as.list(df.changes$TAX_YEAR)
+names(tst) <- df.changes$geoid_2010
+
+df <- readRDS("../mega.rds") |> filter(TAX_YEAR <= 2019) # 13,211,506 records; 1,235,390 organizations
+
+# Adjust dollar amounts for inflation to the year 2019
+adj2019 <- as.data.frame(read_csv("../usd_2019_conv.csv", show_col_types = FALSE))
+df <- merge(df, adj2019, by.x = "TAX_YEAR", by.y = "YEAR")
+df <- df |> mutate(TOT_ASSET_OG = TOT_ASSET,
+                   TOT_REV_OG = TOT_REV,
+                   TOT_EXP_OG = TOT_EXP,
+                   TOT_ASSET = TOT_ASSET * ADJ_2019,
+                   TOT_REV = TOT_REV * ADJ_2019,
+                   TOT_EXP = TOT_EXP * ADJ_2019)
+# Optional, just to keep minimal number of columns
+df <- df |> select(-TOT_ASSET_OG, -TOT_REV_OG, -TOT_EXP_OG, -DATA_COUNT)
+
+# July 14, 2026: if negative, convert to 0
+df <- df |> mutate(TOT_REV = ifelse(TOT_REV < 0, 0, TOT_REV),
+                   TOT_ASSET = ifelse(TOT_ASSET < 0, 0, TOT_ASSET),
+                   TOT_EXP = ifelse(TOT_EXP < 0, 0, TOT_EXP))
+
+# IDs for two counties were changed after 2010. Some datasets use latest ID, others use 2010 ID
+df <- df |> mutate(geoid_2010 = county.census.geoid)
+df$geoid_2010[df$county.census.geoid == "02158"] <- "02270"
+df$geoid_2010[df$county.census.geoid == "46102"] <- "46113"
+
+# Now we need to figure out which orgs we actually will be able to use
+# For sure if they have less than 10 records they won't be eligible
+df <- df |> filter(geoid_2010 %in% eligible_counties) |> filter(!is.na(TOT_REV)) # 496,587 records from 48,300 orgs
+df <- df |> group_by(EIN2) |> 
+      mutate(DATA_COUNT = n()) |> 
+      ungroup() |> filter(DATA_COUNT >= 10) # 401,352 records from 21,296 orgs
+
+# Now need to make sure there is an appropriate number of records before and after the suspected change point
+# First, let's make sure that we are only looking at orgs that have an existing record during the candidate change point year
+df <- merge(df, df.changes |> mutate(topDamage = TRUE), 
+            all.x = TRUE, by = c("geoid_2010", "TAX_YEAR"))
+df <- df |> mutate(topDamage = replace_na(topDamage, FALSE))
+
+eligible_orgs <- df |> group_by(EIN2) |> 
+      summarize(eligible = (sum(topDamage)) > 0) |> 
+      filter(eligible) |>
+      pull(EIN2) # 15,573 orgs 
+
+df <- df |> filter(EIN2 %in% eligible_orgs) # 316,854 records from 15,573 orgs 
+
+# side quest resolving duplicates.. just removing all records in question for now
+bad_groups <- df |> group_by(EIN2, TAX_YEAR) |>
+      summarize(n = n(), .groups = "keep") |>
+      filter(n > 1) # 562 org,year pairs that are unresolved dupes
+bad_groups <- bad_groups |>  select(-n) |> mutate(keep = FALSE)
+
+df <- merge(df, bad_groups, all.x = TRUE, by = c("EIN2", "TAX_YEAR")) |>
+      mutate(keep = replace_na(keep, TRUE)) |>
+      filter(keep) # 315,729 records from 15,573 orgs 
+
+# Now, let's make sure there is an appropriate buffer around the change point
+gaps <- df |> 
+      group_by(EIN2) |>
+      arrange(TAX_YEAR) |>
+      summarise(before = sum(row_number() < which(topDamage)),
+             after = sum(row_number() > which(topDamage)))
+
+eligible_orgs <- gaps |> filter(before >= 5 & after >= 4) |> pull(EIN2) # 11,164 orgs
+
+saveRDS(df |> filter(EIN2 %in% eligible_orgs), "df_eligible_orgs.rds") # 246,231 records
+```
+
+## Hyperparameter Optimization
+### Grid Search
+```{r}
+library(data.table)
+library(readr)
+library(dplyr)
+library(tidyverse)
+library(fields)
+library(mvtnorm)
+source("helper.R")
+
+df <- readRDS("df_eligible_orgs.rds") |> select(-DATA_COUNT, -keep)
+
+# distance matrix of years
+dist_mat_all <- as.matrix(dist(sort(unique(df$TAX_YEAR) - min(df$TAX_YEAR) + 1), diag=TRUE, upper=TRUE))
+
+set.seed(2727)
+orgs_sample <- sample(unique(df$EIN2), size = 50)
+
+combos <- expand.grid(nu = seq(from = 0.01, to = 3, by = 0.07475), 
+                      nugget = seq(from = 0, to = 3, by = 0.1))
+
+best_parameters.null <- setNames(data.frame(matrix(ncol = 3, nrow = 0)), c("ID", "nu", "nugget"))
+best_parameters.L <- setNames(data.frame(matrix(ncol = 3, nrow = 0)), c("ID", "nu", "nugget"))
+best_parameters.R <- setNames(data.frame(matrix(ncol = 3, nrow = 0)), c("ID", "nu", "nugget"))
+
+for (orgID in orgs_sample) {
+      # pull their time series
+      my_data <- df |> filter(EIN2 == orgID) |>
+            mutate(TOT_REV = log1p(TOT_REV),
+                   TOT_EXP = log1p(TOT_EXP),
+                   TOT_ASSET = log1p(TOT_ASSET))
+      all_years <- my_data$TAX_YEAR - min(df$TAX_YEAR) + 1 # all the years we have data for this county
+      log_rev <- my_data |> merge(data.frame(TAX_YEAR = 1991:2019), all = TRUE) |> arrange(TAX_YEAR) |> pull(TOT_REV)
+      
+      candidate <- (my_data  |> filter(topDamage) |> select(TAX_YEAR) |> pull()) - min(df$TAX_YEAR) + 1
+      left_years <- all_years[1:which(all_years == candidate)-1]
+      right_years <- all_years[which(all_years == candidate):length(all_years)]
+      
+      ### Null Model ###
+      curr_all_years <- c(left_years, right_years)
+      centered_rev <- log_rev[curr_all_years] - mean(log_rev[curr_all_years])
+      dist_mat <- dist_mat_all[curr_all_years, curr_all_years]
+      dist_mat <- (dist_mat - min(dist_mat)) / (max(dist_mat) - min(dist_mat))
+      
+      # grid search (if doing Nelder-Mead, multiply get_likelihood_sigma by -1)
+      likelihood_wrapper.null <- function(pars.vec){
+            return(get_likelihood_sigma(row = pars.vec,
+                                             dist_mat = dist_mat,
+                                             rho = 1,
+                                             data = centered_rev))
+      }
+      
+      likelihoods.null <- apply(combos, MARGIN = 1, likelihood_wrapper.null)
+      tst <- as.data.frame(list(nu = combos$nu, nugget = combos$nugget, likelihood = likelihoods.null))
+      best_parameters.null <- rbind(best_parameters.null, 
+                                    as.data.frame(list(ein = orgID,
+                                                       nu = tst[which.max(tst$likelihood),]$nu,
+                                                       nugget = tst[which.max(tst$likelihood),]$nugget)))
+      
+      ### Alternative Model ###
+      
+      # Left
+      centered_rev.L <- log_rev[left_years] - mean(log_rev[left_years])
+      dist_mat.L <- dist_mat_all[left_years, left_years]
+      dist_mat.L <- (dist_mat.L - min(dist_mat.L)) / (max(dist_mat.L) - min(dist_mat.L))
+      
+      likelihood_wrapper.left <- function(pars.vec){
+            return(get_likelihood_sigma(row = pars.vec,
+                                             dist_mat = dist_mat.L,
+                                             rho = 1,
+                                             data = centered_rev.L))
+      }
+      
+      likelihoods.L <- apply(combos, MARGIN = 1, likelihood_wrapper.left)
+      tst <- as.data.frame(list(nu = combos$nu, nugget = combos$nugget, likelihood = likelihoods.L))
+      best_parameters.L <- rbind(best_parameters.L, 
+                                    as.data.frame(list(ein = orgID,
+                                                       nu = tst[which.max(tst$likelihood),]$nu,
+                                                       nugget = tst[which.max(tst$likelihood),]$nugget)))
+      
+      # Right
+      centered_rev.R <- log_rev[right_years] - mean(log_rev[right_years])
+      dist_mat.R <- dist_mat_all[right_years, right_years]
+      dist_mat.R <- (dist_mat.R - min(dist_mat.R)) / (max(dist_mat.R) - min(dist_mat.R))
+      
+      likelihood_wrapper.right <- function(pars.vec){
+            return(get_likelihood_sigma(row = pars.vec,
+                                             dist_mat = dist_mat.R,
+                                             rho = 1,
+                                             data = centered_rev.R))
+      }
+      
+      likelihoods.R <- apply(combos, MARGIN = 1, likelihood_wrapper.right)
+      tst <- as.data.frame(list(nu = combos$nu, nugget = combos$nugget, likelihood = likelihoods.R))
+      best_parameters.R <- rbind(best_parameters.R, 
+                                    as.data.frame(list(ein = orgID,
+                                                       nu = tst[which.max(tst$likelihood),]$nu,
+                                                       nugget = tst[which.max(tst$likelihood),]$nugget)))
+}
+
+all_best <- rbind(best_parameters.null, best_parameters.L, best_parameters.R) |> select(nu,nugget)
+cl <- kmeans(all_best, 5, iter.max = 20, nstart = 3)
+# saveRDS(cl, "ORG_init_conds_50.rds")
+
+cl$centers
+```
+
+### Nelder-Mead
+Note: This took a little over 4 hours to run
+```{r}
+library(data.table)
+library(readr)
+library(dplyr)
+library(tidyverse)
+library(fields)
+library(mvtnorm)
+source("helper.R")
+
+df <- readRDS("df_eligible_orgs.rds") |> select(-DATA_COUNT, -keep)
+
+# distance matrix of years
+dist_mat_all <- as.matrix(dist(sort(unique(df$TAX_YEAR) - min(df$TAX_YEAR) + 1), diag=TRUE, upper=TRUE))
+
+init_conds <- readRDS("ORG_init_conds_50.rds")$centers
+
+best_parameters.null <- setNames(data.frame(matrix(ncol = 3, nrow = 0)), c("ein", "nu", "nugget"))
+best_parameters.L <- setNames(data.frame(matrix(ncol = 3, nrow = 0)), c("ein", "nu", "nugget"))
+best_parameters.R <- setNames(data.frame(matrix(ncol = 3, nrow = 0)), c("ein", "nu", "nugget"))
+
+errs <- c()
+for (orgID in unique(df$EIN2)) {
+      print(orgID)
+      # pull their time series
+      my_data <- df |> filter(EIN2 == orgID) |>
+            mutate(TOT_REV = log1p(TOT_REV),
+                   TOT_EXP = log1p(TOT_EXP),
+                   TOT_ASSET = log1p(TOT_ASSET))
+      all_years <- my_data$TAX_YEAR - min(df$TAX_YEAR) + 1 # all the years we have data for this county
+      log_rev <- my_data |> merge(data.frame(TAX_YEAR = 1991:2019), all = TRUE) |> arrange(TAX_YEAR) |> pull(TOT_REV)
+      
+      candidate <- (my_data  |> filter(topDamage) |> select(TAX_YEAR) |> pull()) - min(df$TAX_YEAR) + 1
+      left_years <- all_years[1:which(all_years == candidate)-1]
+      right_years <- all_years[which(all_years == candidate):length(all_years)]
+      
+      ### Null Model ###
+      curr_all_years <- c(left_years, right_years)
+      centered_rev <- log_rev[curr_all_years] - mean(log_rev[curr_all_years])
+      dist_mat <- dist_mat_all[curr_all_years, curr_all_years]
+      dist_mat <- (dist_mat - min(dist_mat)) / (max(dist_mat) - min(dist_mat))
+      
+      likelihood_wrapper.null <- function(pars.vec){
+            return(-1 * get_likelihood_sigma(row = pars.vec,
+                                             dist_mat = dist_mat,
+                                             rho = 1,
+                                             data = centered_rev))
+      }
+      
+      tst <- setNames(data.frame(matrix(ncol = 6, nrow = 0)), c("nu.init", "nugg.init", "nu", "nugget", "likelihood", "trial"))
+i <- 2      
+      for (i in 1:nrow(init_conds)){
+            res <- constrOptim(theta = init_conds[i,], 
+                               f = likelihood_wrapper.null,
+                               grad = NULL,
+                               ui = rbind(c(1,0),c(-1,0),c(0,1)), #rbind(c(1,0),c(-1,0),c(0,1))
+                               ci = c(0.001,-3.5,0)) #c(0.001,-3.5, 0)
+            tst[nrow(tst)+1,] <- c(c(init_conds[i,1], init_conds[i,2], res$par[1], res$par[2], -1*res$value, i))
+      }
+
+      best_parameters.null <- rbind(best_parameters.null, 
+                                    as.data.frame(list(ein = orgID,
+                                                       nu = tst[which.max(tst$likelihood),]$nu,
+                                                       nugget = tst[which.max(tst$likelihood),]$nugget)))
+      
+      ### Alternative Model ###
+      
+      # Left
+      centered_rev.L <- log_rev[left_years] - mean(log_rev[left_years])
+      if (var(centered_rev.L) == 0){
+            errs <- c(errs, orgID)
+            next
+            }
+      dist_mat.L <- dist_mat_all[left_years, left_years]
+      dist_mat.L <- (dist_mat.L - min(dist_mat.L)) / (max(dist_mat.L) - min(dist_mat.L))
+      
+      likelihood_wrapper.left <- function(pars.vec){
+            return(-1 * get_likelihood_sigma(row = pars.vec,
+                                             dist_mat = dist_mat.L,
+                                             rho = 1,
+                                             data = centered_rev.L))
+      }
+      
+      tst <- setNames(data.frame(matrix(ncol = 6, nrow = 0)), c("nu.init", "nugg.init", "nu", "nugget", "likelihood", "trial"))
+      for (i in 1:nrow(init_conds)){
+            res <- constrOptim(theta = init_conds[i,], 
+                               f = likelihood_wrapper.left,
+                               grad = NULL,
+                               ui = rbind(c(1,0),c(-1,0),c(0,1)), #rbind(c(1,0),c(-1,0),c(0,1))
+                               ci = c(0.001,-3.5,0)) #c(0.001,-3.5, 0)
+            tst[nrow(tst)+1,] <- c(c(init_conds[i,1], init_conds[i,2], res$par[1], res$par[2], -1*res$value, i))
+      }
+      best_parameters.L <- rbind(best_parameters.L, 
+                                    as.data.frame(list(ein = orgID,
+                                                       nu = tst[which.max(tst$likelihood),]$nu,
+                                                       nugget = tst[which.max(tst$likelihood),]$nugget)))
+      
+      # Right
+      centered_rev.R <- log_rev[right_years] - mean(log_rev[right_years])
+      if (var(centered_rev.R) == 0){
+            errs <- c(errs, orgID)
+            next
+            }
+      dist_mat.R <- dist_mat_all[right_years, right_years]
+      dist_mat.R <- (dist_mat.R - min(dist_mat.R)) / (max(dist_mat.R) - min(dist_mat.R))
+      
+      likelihood_wrapper.right <- function(pars.vec){
+            return(-1 * get_likelihood_sigma(row = pars.vec,
+                                             dist_mat = dist_mat.R,
+                                             rho = 1,
+                                             data = centered_rev.R))
+      }
+      
+      tst <- setNames(data.frame(matrix(ncol = 6, nrow = 0)), c("nu.init", "nugg.init", "nu", "nugget", "likelihood", "trial"))
+      for (i in 1:nrow(init_conds)){
+            res <- constrOptim(theta = init_conds[i,], 
+                               f = likelihood_wrapper.right,
+                               grad = NULL,
+                               ui = rbind(c(1,0),c(-1,0),c(0,1)), #rbind(c(1,0),c(-1,0),c(0,1))
+                               ci = c(0.001,-3.5,0)) #c(0.001,-3.5, 0)
+            tst[nrow(tst)+1,] <- c(c(init_conds[i,1], init_conds[i,2], res$par[1], res$par[2], -1*res$value, i))
+      }
+      best_parameters.R <- rbind(best_parameters.R, 
+                                    as.data.frame(list(ein = orgID,
+                                                       nu = tst[which.max(tst$likelihood),]$nu,
+                                                       nugget = tst[which.max(tst$likelihood),]$nugget)))
+
+}
+
+saveRDS(best_parameters.null, "ORG_best_null.rds")
+saveRDS(best_parameters.L, "ORG_best_L.rds")
+saveRDS(best_parameters.R, "ORG_best_R.rds")
+```
+
+## LRT
+```{r}
+library(data.table)
+library(readr)
+library(dplyr)
+library(tidyverse)
+library(fields)
+library(mvtnorm)
+
+df <- readRDS("df_eligible_orgs.rds") |> select(-DATA_COUNT, -keep)
+
+# distance matrix of years
+dist_mat_all <- as.matrix(dist(sort(unique(df$TAX_YEAR) - min(df$TAX_YEAR) + 1), diag=TRUE, upper=TRUE))
+
+best_all.null <- readRDS("ORG_best_null.rds")
+best_all.L <- readRDS("ORG_best_L.rds")
+best_all.R <- readRDS("ORG_best_R.rds")
+missing_ein <- union(setdiff(unique(df$EIN2), best_all.L$ein),
+                     setdiff(unique(df$EIN2), best_all.R$ein))
+
+# saveRDS(missing_ein, "org_missing_ein.rds")
+
+rho = 1
+
+reject_null <- list()
+for (my_org in unique(df$EIN2)) {
+      if (my_org %in% missing_ein){next}
+      # pull their time series
+      my_data <- df |> filter(EIN2 == my_org) |>
+            mutate(TOT_REV = log1p(TOT_REV),
+                   TOT_EXP = log1p(TOT_EXP),
+                   TOT_ASSET = log1p(TOT_ASSET))
+      all_years <- my_data$TAX_YEAR - min(df$TAX_YEAR) + 1 # all the years we have data for this county
+      log_rev <- my_data |> merge(data.frame(TAX_YEAR = 1991:2019), all = TRUE) |> arrange(TAX_YEAR) |> pull(TOT_REV)
+      
+      candidate <- (my_data  |> filter(topDamage) |> select(TAX_YEAR) |> pull()) - min(df$TAX_YEAR) + 1
+      
+      # pull best parameters
+      best.null <- best_all.null |> filter(ein == my_org)
+      best.L <- best_all.L |> filter(ein == my_org)
+      best.R <- best_all.R |> filter(ein == my_org)
+      
+      
+      # Determine the left and right time series corresponding to the current candidate change point
+      left_years <- all_years[1:which(all_years == candidate)-1]
+      right_years <- all_years[which(all_years == candidate):length(all_years)]
+      
+      ### Null Hypothesis Model ###
+      curr_all_years <- c(left_years, right_years) # Redundant for single candidate
+      centered_rev <- log_rev[curr_all_years] - mean(log_rev[curr_all_years]) # center the log revenue values so they are mean 0
+      
+      dist_mat <- dist_mat_all[curr_all_years, curr_all_years]
+      dist_mat <- (dist_mat - min(dist_mat)) / (max(dist_mat) - min(dist_mat))
+      Sigma_0 <- Matern(d = dist_mat,
+                        smoothness = best.null$nu,
+                        range = rho,
+                        phi = 1) + diag(best.null$nugget, dim(dist_mat)[1])
+      
+      sigma.sqrd_0 <- (1/length(centered_rev)) * (centered_rev %*% chol2inv(chol(Sigma_0)) %*% centered_rev)[1,1]
+      Sigma_0 <- sigma.sqrd_0 * Sigma_0
+      
+      ### Alternative Hypothesis Model ###
+      # center the log revenue values so they are mean 0
+      centered_rev.L <- log_rev[left_years] - mean(log_rev[left_years])
+      centered_rev.R <- log_rev[right_years] - mean(log_rev[right_years])
+      
+      # compute and normalize distance matrices
+      dist_mat.L <- dist_mat_all[left_years, left_years]
+      dist_mat.L <- (dist_mat.L - min(dist_mat.L)) / (max(dist_mat.L) - min(dist_mat.L))
+      
+      dist_mat.R <- dist_mat_all[right_years, right_years]
+      dist_mat.R <- (dist_mat.R - min(dist_mat.R)) / (max(dist_mat.R) - min(dist_mat.R))
+      
+      # Compute Matern covariance matrices
+      Sigma_L <- Matern(d = dist_mat.L,
+                        smoothness = best.L$nu,
+                        range = rho,
+                        phi = 1) + diag(best.L$nugget, dim(dist_mat.L)[1])
+      sigma.sqrd_L <- (1/length(left_years)) * (centered_rev.L %*% chol2inv(chol(Sigma_L)) %*% centered_rev.L)[1,1]
+      Sigma_L <- sigma.sqrd_L * Sigma_L
+      
+      Sigma_R <- Matern(d = dist_mat.R,
+                        smoothness = best.R$nu,
+                        range = rho,
+                        phi = 1) + diag(best.R$nugget, dim(dist_mat.R)[1])
+      sigma.sqrd_R <- (1/length(right_years)) * (centered_rev.R %*% chol2inv(chol(Sigma_R)) %*% centered_rev.R)[1,1]
+      Sigma_R <- sigma.sqrd_R * Sigma_R
+      
+      ### Likelihood Ratio Test ###
+      L_0 <- dmvnorm(centered_rev, 
+                     mean = rep(0, length(centered_rev)), 
+                     sigma = Sigma_0,
+                     log = TRUE)
+      
+      L_left <- dmvnorm(centered_rev.L, 
+                        mean = rep(0, length(centered_rev.L)), 
+                        sigma = Sigma_L,
+                        log = TRUE)
+      
+      L_right <- dmvnorm(centered_rev.R, 
+                         mean = rep(0, length(centered_rev.R)), 
+                         sigma = Sigma_R,
+                         log = TRUE)
+      
+      L_alt <- L_left + L_right
+      
+      
+      # likelihood ratio test statistic
+      lrt <- -2*L_0 + 2*L_alt
+      doF <- 4 #  (mu1, mu2, Sigma1, Sigma2, nu1, nu2, nugget1, nugget2) vs (mu, Sigma, nu, nugget) 
+      reject_null[my_org] <- (lrt > qchisq(p = 0.05, df = doF, lower.tail = FALSE))
+}
+
+sum(unlist(reject_null)) / length(reject_null) # 37.25 % of the time we have enough evidence to reject the null
+```
+
+
+
+# Empirical Distribution Org-Level
+```{r}
+library(readr)
+library(dplyr)
+library(tidyverse)
+
+set.seed(2727)
+df <- readRDS("df_eligible_orgs.rds") |> select(-DATA_COUNT, -keep)
+
+df <- df |> filter(!(geoid_2010 %in% readRDS("org_missing_ein.rds"))) |> 
+      group_by(EIN2) |>
+      mutate(n = n(),
+             row_num = row_number(),
+             eligible = (row_num > 5 & row_num <= n-4)) |> ungroup()
+
+candidates_all <- list()
+for (i in 1:50) {
+      candidates <- df |> group_by(EIN2) |>
+            filter(eligible) |>
+            slice_sample(n = 1) |>
+            select(EIN2, TAX_YEAR)
+      
+      candidates_list <- candidates |> pull(TAX_YEAR) |> as.list()
+      names(candidates_list) <- candidates |> pull(EIN2)
+      
+      candidates_all[[as.character(i)]] <- candidates_list
+}
+# saveRDS(candidates_all, "ORG_random_candidates50.rds")
+```
+
+## Hyperparameter Optimization
+Grid Search
+```{r}
+library(data.table)
+library(readr)
+library(dplyr)
+library(tidyverse)
+library(fields)
+library(mvtnorm)
+source("helper.R")
+
+df <- readRDS("df_eligible_orgs.rds") |> select(-DATA_COUNT, -keep)
+candidates_all <- readRDS("ORG_random_candidates50.rds")
+
+# distance matrix of years
+dist_mat_all <- as.matrix(dist(sort(unique(df$TAX_YEAR) - min(df$TAX_YEAR) + 1), diag=TRUE, upper=TRUE))
+
+set.seed(2727)
+orgs_sample <- sample(unique(df$EIN2), size = 50)
+
+combos <- expand.grid(nu = seq(from = 0.01, to = 3, by = 0.07475), 
+                      nugget = seq(from = 0, to = 3, by = 0.1))
+
+best_parameters.null <- setNames(data.frame(matrix(ncol = 4, nrow = 0)), c("ein", "nu", "nugget", "trial"))
+best_parameters.L <- setNames(data.frame(matrix(ncol = 4, nrow = 0)), c("ein", "nu", "nugget", "trial"))
+best_parameters.R <- setNames(data.frame(matrix(ncol = 4, nrow = 0)), c("ein", "nu", "nugget", "trial"))
+
+for (orgID in orgs_sample) {
+      # pull their time series
+      my_data <- df |> filter(EIN2 == orgID) |>
+            mutate(TOT_REV = log1p(TOT_REV),
+                   TOT_EXP = log1p(TOT_EXP),
+                   TOT_ASSET = log1p(TOT_ASSET))
+      all_years <- my_data$TAX_YEAR - min(df$TAX_YEAR) + 1 # all the years we have data for this county
+      log_rev <- my_data |> merge(data.frame(TAX_YEAR = 1991:2019), all = TRUE) |> arrange(TAX_YEAR) |> pull(TOT_REV)
+      
+      for (i in names(candidates_all)){      
+            candidate <- candidates_all[[i]][[orgID]] - min(df$TAX_YEAR) + 1
+            left_years <- all_years[1:which(all_years == candidate)-1]
+            right_years <- all_years[which(all_years == candidate):length(all_years)]
+            
+            ### Null Model ###
+            curr_all_years <- c(left_years, right_years)
+            centered_rev <- log_rev[curr_all_years] - mean(log_rev[curr_all_years])
+            dist_mat <- dist_mat_all[curr_all_years, curr_all_years]
+            dist_mat <- (dist_mat - min(dist_mat)) / (max(dist_mat) - min(dist_mat))
+            
+            # grid search (if doing Nelder-Mead, multiply get_likelihood_sigma by -1)
+            likelihood_wrapper.null <- function(pars.vec){
+                  return(get_likelihood_sigma(row = pars.vec,
+                                                   dist_mat = dist_mat,
+                                                   rho = 1,
+                                                   data = centered_rev))
+            }
+            
+            likelihoods.null <- apply(combos, MARGIN = 1, likelihood_wrapper.null)
+            tst <- as.data.frame(list(nu = combos$nu, nugget = combos$nugget, likelihood = likelihoods.null))
+            best_parameters.null <- rbind(best_parameters.null, 
+                                          as.data.frame(list(ein = orgID,
+                                                             nu = tst[which.max(tst$likelihood),]$nu,
+                                                             nugget = tst[which.max(tst$likelihood),]$nugget,
+                                                             trial = i)))
+            
+            ### Alternative Model ###
+            
+            # Left
+            centered_rev.L <- log_rev[left_years] - mean(log_rev[left_years])
+            dist_mat.L <- dist_mat_all[left_years, left_years]
+            dist_mat.L <- (dist_mat.L - min(dist_mat.L)) / (max(dist_mat.L) - min(dist_mat.L))
+            
+            likelihood_wrapper.left <- function(pars.vec){
+                  return(get_likelihood_sigma(row = pars.vec,
+                                                   dist_mat = dist_mat.L,
+                                                   rho = 1,
+                                                   data = centered_rev.L))
+            }
+            
+            likelihoods.L <- apply(combos, MARGIN = 1, likelihood_wrapper.left)
+            tst <- as.data.frame(list(nu = combos$nu, nugget = combos$nugget, likelihood = likelihoods.L))
+            best_parameters.L <- rbind(best_parameters.L, 
+                                          as.data.frame(list(ein = orgID,
+                                                             nu = tst[which.max(tst$likelihood),]$nu,
+                                                             nugget = tst[which.max(tst$likelihood),]$nugget,
+                                                             trial = i)))
+            
+            # Right
+            centered_rev.R <- log_rev[right_years] - mean(log_rev[right_years])
+            dist_mat.R <- dist_mat_all[right_years, right_years]
+            dist_mat.R <- (dist_mat.R - min(dist_mat.R)) / (max(dist_mat.R) - min(dist_mat.R))
+            
+            likelihood_wrapper.right <- function(pars.vec){
+                  return(get_likelihood_sigma(row = pars.vec,
+                                                   dist_mat = dist_mat.R,
+                                                   rho = 1,
+                                                   data = centered_rev.R))
+            }
+            
+            likelihoods.R <- apply(combos, MARGIN = 1, likelihood_wrapper.right)
+            tst <- as.data.frame(list(nu = combos$nu, nugget = combos$nugget, likelihood = likelihoods.R))
+            best_parameters.R <- rbind(best_parameters.R, 
+                                          as.data.frame(list(ein = orgID,
+                                                             nu = tst[which.max(tst$likelihood),]$nu,
+                                                             nugget = tst[which.max(tst$likelihood),]$nugget,
+                                                             trial = i)))
+            }
+}
+
+all_best <- rbind(best_parameters.null, best_parameters.L, best_parameters.R) |> select(nu,nugget)
+cl <- kmeans(all_best, 5, iter.max = 20, nstart = 3)
+# saveRDS(cl, "ORG_empirical_init_conds_50.rds")
+
+cl$centers
+```
+
+Nelder-Mead
+```{r}
+library(data.table)
+library(readr)
+library(dplyr)
+library(tidyverse)
+library(fields)
+library(mvtnorm)
+library(doParallel)
+source("helper.R")
+
+candidates_all <- readRDS("ORG_random_candidates50.rds")
+df <- readRDS("df_eligible_orgs.rds") |> select(-DATA_COUNT, -keep)
+
+# distance matrix of years
+dist_mat_all <- as.matrix(dist(sort(unique(df$TAX_YEAR) - min(df$TAX_YEAR) + 1), diag=TRUE, upper=TRUE))
+
+init_conds <- readRDS("ORG_empirical_init_conds_50.rds")$centers
+
+best_parameters <- setNames(data.frame(matrix(ncol = 5, nrow = 0)), c("type", "ein", "nu", "nugget", "trial"))
+
+errs <- c()
+combos <- expand.grid(unique(df$EIN2), as.character(1:length(candidates_all))) |> arrange(Var1, Var2)
+
+test_idx <- c(1:10, 51:60)
+resBest <- foreach(i = test_idx, .combine = 'rbind', .packages = c("dplyr", "fields", "mvtnorm"), .verbose = TRUE, .errorhandling = "remove") %do% {
+      orgID <- combos$Var1[i]
+      trialID <- combos$Var2[i]
+      print(paste("EIN:", orgID, "Trial Number:", trialID))
+      # pull their time series
+      my_data <- df |> filter(EIN2 == orgID) |>
+            mutate(TOT_REV = log1p(TOT_REV),
+                   TOT_EXP = log1p(TOT_EXP),
+                   TOT_ASSET = log1p(TOT_ASSET))
+      all_years <- my_data$TAX_YEAR - min(df$TAX_YEAR) + 1 # all the years we have data for this county
+      log_rev <- my_data |> merge(data.frame(TAX_YEAR = 1991:2019), all = TRUE) |> arrange(TAX_YEAR) |> pull(TOT_REV)
+      
+      candidate <- candidates_all[[trialID]][[orgID]] - min(df$TAX_YEAR) + 1
+      left_years <- all_years[1:which(all_years == candidate)-1]
+      right_years <- all_years[which(all_years == candidate):length(all_years)]
+      
+      ### Null Model ###
+      curr_all_years <- c(left_years, right_years)
+      centered_rev <- log_rev[curr_all_years] - mean(log_rev[curr_all_years])
+      dist_mat <- dist_mat_all[curr_all_years, curr_all_years]
+      dist_mat <- (dist_mat - min(dist_mat)) / (max(dist_mat) - min(dist_mat))
+      
+      likelihood_wrapper.null <- function(pars.vec){
+            return(-1 * get_likelihood_sigma(row = pars.vec,
+                                             dist_mat = dist_mat,
+                                             rho = 1,
+                                             data = centered_rev))
+      }
+      
+      tst <- setNames(data.frame(matrix(ncol = 6, nrow = 0)), c("nu.init", "nugg.init", "nu", "nugget", "likelihood", "trial"))
+i <- 2      
+      for (i in 1:nrow(init_conds)){
+            res <- constrOptim(theta = init_conds[i,], 
+                               f = likelihood_wrapper.null,
+                               grad = NULL,
+                               ui = rbind(c(1,0),c(-1,0),c(0,1)), #rbind(c(1,0),c(-1,0),c(0,1))
+                               ci = c(0.001,-3.5,0)) #c(0.001,-3.5, 0)
+            tst[nrow(tst)+1,] <- c(c(init_conds[i,1], init_conds[i,2], res$par[1], res$par[2], -1*res$value, i))
+      }
+      res.null <- as.data.frame(list(type = "null",
+                         ein = orgID,
+                         nu = tst[which.max(tst$likelihood),]$nu,
+                         nugget = tst[which.max(tst$likelihood),]$nugget,
+                         trial = trialID))
+      
+      ### Alternative Model ###
+      
+      # Left
+      centered_rev.L <- log_rev[left_years] - mean(log_rev[left_years])
+      if (var(centered_rev.L) == 0){
+            cat(i, file = file.path("errors/", paste0(i, ".txt")))
+            }
+      dist_mat.L <- dist_mat_all[left_years, left_years]
+      dist_mat.L <- (dist_mat.L - min(dist_mat.L)) / (max(dist_mat.L) - min(dist_mat.L))
+      
+      likelihood_wrapper.left <- function(pars.vec){
+            return(-1 * get_likelihood_sigma(row = pars.vec,
+                                             dist_mat = dist_mat.L,
+                                             rho = 1,
+                                             data = centered_rev.L))
+      }
+      
+      tst <- setNames(data.frame(matrix(ncol = 6, nrow = 0)), c("nu.init", "nugg.init", "nu", "nugget", "likelihood", "trial"))
+      for (i in 1:nrow(init_conds)){
+            res <- constrOptim(theta = init_conds[i,], 
+                               f = likelihood_wrapper.left,
+                               grad = NULL,
+                               ui = rbind(c(1,0),c(-1,0),c(0,1)), #rbind(c(1,0),c(-1,0),c(0,1))
+                               ci = c(0.001,-3.5,0)) #c(0.001,-3.5, 0)
+            tst[nrow(tst)+1,] <- c(c(init_conds[i,1], init_conds[i,2], res$par[1], res$par[2], -1*res$value, i))
+      }
+      res.left <- as.data.frame(list(type = "left",
+                         ein = orgID,
+                         nu = tst[which.max(tst$likelihood),]$nu,
+                         nugget = tst[which.max(tst$likelihood),]$nugget,
+                         trial = trialID))
+      
+      # Right
+      centered_rev.R <- log_rev[right_years] - mean(log_rev[right_years])
+      if (var(centered_rev.R) == 0){
+            cat(i, file = file.path("errors/", paste0(i, ".txt")))
+            }
+      dist_mat.R <- dist_mat_all[right_years, right_years]
+      dist_mat.R <- (dist_mat.R - min(dist_mat.R)) / (max(dist_mat.R) - min(dist_mat.R))
+      
+      likelihood_wrapper.right <- function(pars.vec){
+            return(-1 * get_likelihood_sigma(row = pars.vec,
+                                             dist_mat = dist_mat.R,
+                                             rho = 1,
+                                             data = centered_rev.R))
+      }
+      
+      tst <- setNames(data.frame(matrix(ncol = 6, nrow = 0)), c("nu.init", "nugg.init", "nu", "nugget", "likelihood", "trial"))
+      for (i in 1:nrow(init_conds)){
+            res <- constrOptim(theta = init_conds[i,], 
+                               f = likelihood_wrapper.right,
+                               grad = NULL,
+                               ui = rbind(c(1,0),c(-1,0),c(0,1)), #rbind(c(1,0),c(-1,0),c(0,1))
+                               ci = c(0.001,-3.5,0)) #c(0.001,-3.5, 0)
+            tst[nrow(tst)+1,] <- c(c(init_conds[i,1], init_conds[i,2], res$par[1], res$par[2], -1*res$value, i))
+      }
+      rbind(res.null,
+            res.left,
+            as.data.frame(list(type = "right",
+                         ein = orgID,
+                         nu = tst[which.max(tst$likelihood),]$nu,
+                         nugget = tst[which.max(tst$likelihood),]$nugget,
+                         trial = trialID)))
+
+}
+
+# saveRDS(resBest, "empirical_best_test.rds")
+
+```
+
+## LRT
+```{r}
+library(readr)
+library(dplyr)
+library(tidyverse)
+
+glued <- rbind(readRDS("ORG_empirical_best_1.rds"), 
+               readRDS("ORG_empirical_best_2.rds"),
+               readRDS("ORG_empirical_best_3.rds"),
+               readRDS("ORG_empirical_best_4.rds"),
+               readRDS("ORG_empirical_best_5.rds"))
+
+# Creating a list of lists
+best_all <- glued |> 
+      mutate(ID = paste0(ein,".",trial)) |> 
+      select(-ein,-trial) # First, creating an ID for each org,trial pair
+best_all <- split(best_all, best_all$ID) # The outer list names are these IDs
+best_all <- lapply(best_all, function(x) {split(x,x$type)}) # The inner list names are null, left, right with elements being the values nu and nugget
+# Example: best_all$ID$left$nu
+
+saveRDS(best_all, "ORG_best_empirical_all.rds")
+```
+
+
+```{r}
+library(readr)
+library(dplyr)
+library(tidyverse)
+library(fields)
+library(mvtnorm)
+library(doParallel)
+
+candidates_all <- readRDS("ORG_random_candidates50.rds")
+df <- readRDS("df_eligible_orgs.rds") |> select(-DATA_COUNT, -keep)
+
+# distance matrix of years
+dist_mat_all <- as.matrix(dist(sort(unique(df$TAX_YEAR) - min(df$TAX_YEAR) + 1), diag=TRUE, upper=TRUE))
+
+best_all <- readRDS("ORG_best_empirical_all.rds")
+
+rho = 1
+
+# note: .inorder = FALSE so the outer list won't be in trial order... I think for our purposes ok
+res <- foreach(trialID = 1:3, .packages = c("dplyr", "fields", "mvtnorm"), .inorder = FALSE) %dopar% { # length(candidates_all)
+      reject_null <- list()
+      print(paste0("Trial: ", trialID))
+      for (orgID in unique(df$EIN2)){
+            ID <- paste0(orgID, ".", trialID)
+            if (!(ID %in% names(best_all))){
+                  print(paste("Missing ID:", ID))
+                  next
+            }
+            # pull their time series
+            my_data <- df |> filter(EIN2 == orgID) |>
+                  mutate(TOT_REV = log1p(TOT_REV),
+                         TOT_EXP = log1p(TOT_EXP),
+                         TOT_ASSET = log1p(TOT_ASSET))
+            all_years <- my_data$TAX_YEAR - min(df$TAX_YEAR) + 1 # all the years we have data for this county
+            log_rev <- my_data |> merge(data.frame(TAX_YEAR = 1991:2019), all = TRUE) |> arrange(TAX_YEAR) |> pull(TOT_REV)
+            
+            candidate <- candidates_all[[trialID]][[orgID]] - min(df$TAX_YEAR) + 1
+            
+            # pull best parameters
+            best.curr <- best_all[[ID]] # best.curr$left$nu
+      
+            # Determine the left and right time series corresponding to the current candidate change point
+            left_years <- all_years[1:which(all_years == candidate)-1]
+            right_years <- all_years[which(all_years == candidate):length(all_years)]
+            
+            ### Null Hypothesis Model ###
+            curr_all_years <- c(left_years, right_years) # Redundant for single candidate
+            centered_rev <- log_rev[curr_all_years] - mean(log_rev[curr_all_years]) # center the log revenue values so they are mean 0
+            
+            dist_mat <- dist_mat_all[curr_all_years, curr_all_years]
+            dist_mat <- (dist_mat - min(dist_mat)) / (max(dist_mat) - min(dist_mat))
+            Sigma_0 <- Matern(d = dist_mat,
+                              smoothness = best.curr$null$nu,
+                              range = rho,
+                              phi = 1) + diag(best.curr$null$nugget, dim(dist_mat)[1])
+            
+            sigma.sqrd_0 <- (1/length(centered_rev)) * (centered_rev %*% chol2inv(chol(Sigma_0)) %*% centered_rev)[1,1]
+            Sigma_0 <- sigma.sqrd_0 * Sigma_0
+            
+            ### Alternative Hypothesis Model ###
+            # center the log revenue values so they are mean 0
+            centered_rev.L <- log_rev[left_years] - mean(log_rev[left_years])
+            centered_rev.R <- log_rev[right_years] - mean(log_rev[right_years])
+            
+            # compute and normalize distance matrices
+            dist_mat.L <- dist_mat_all[left_years, left_years]
+            dist_mat.L <- (dist_mat.L - min(dist_mat.L)) / (max(dist_mat.L) - min(dist_mat.L))
+            
+            dist_mat.R <- dist_mat_all[right_years, right_years]
+            dist_mat.R <- (dist_mat.R - min(dist_mat.R)) / (max(dist_mat.R) - min(dist_mat.R))
+            
+            # Compute Matern covariance matrices
+            Sigma_L <- Matern(d = dist_mat.L,
+                        smoothness = best.curr$left$nu,
+                        range = rho,
+                        phi = 1) + diag(best.curr$left$nugget, dim(dist_mat.L)[1])
+            sigma.sqrd_L <- (1/length(left_years)) * (centered_rev.L %*% chol2inv(chol(Sigma_L)) %*% centered_rev.L)[1,1]
+            Sigma_L <- sigma.sqrd_L * Sigma_L
+            
+            Sigma_R <- Matern(d = dist_mat.R,
+                        smoothness = best.curr$right$nu,
+                        range = rho,
+                        phi = 1) + diag(best.curr$right$nugget, dim(dist_mat.R)[1])
+            sigma.sqrd_R <- (1/length(right_years)) * (centered_rev.R %*% chol2inv(chol(Sigma_R)) %*% centered_rev.R)[1,1]
+            Sigma_R <- sigma.sqrd_R * Sigma_R
+            
+            ### Likelihood Ratio Test ###
+            L_0 <- dmvnorm(centered_rev, 
+                           mean = rep(0, length(centered_rev)), 
+                           sigma = Sigma_0,
+                           log = TRUE)
+            
+            L_left <- dmvnorm(centered_rev.L, 
+                              mean = rep(0, length(centered_rev.L)), 
+                              sigma = Sigma_L,
+                              log = TRUE)
+            
+            L_right <- dmvnorm(centered_rev.R, 
+                               mean = rep(0, length(centered_rev.R)), 
+                               sigma = Sigma_R,
+                               log = TRUE)
+            
+            L_alt <- L_left + L_right
+      
+            
+            # likelihood ratio test statistic
+            lrt <- -2*L_0 + 2*L_alt
+            doF <- 4 #  (mu1, mu2, Sigma1, Sigma2, nu1, nu2, nugget1, nugget2) vs (mu, Sigma, nu, nugget)
+            reject_null[[orgID]] <- (lrt > qchisq(p = 0.05, df = doF, lower.tail = FALSE))
+
+      }
+      # reject_null_all[[as.character(trialID)]] <- reject_null
+      reject_null
+}
+
+res.final <- unlist(lapply(res, function(x){sum(unlist(x)) / length(x)}))
+hist(res.final)
+sd(res.final)
+```
+
+
+
+
+## Bootstrap
+```{r}
+library(readr)
+library(dplyr)
+library(tidyverse)
+library(doParallel)
+
+res <- readRDS("org_empirical_lrt_res.rds")
+
+# testing that this works
+# tst <- unlist(res)
+# tst <- split(tst, names(tst))
+# tst2 <- unname(tst$`EIN-01-0245341`)
+# tst3 <- c()
+# for (i in 1:length(res)){
+#       tst3 <- c(tst3, res[[i]]$`EIN-01-0245341`)
+# }
+# all(tst2 == tst3)
+# tst <- lapply(tst, unname)
+
+res <- unlist(res)
+res <- split(res, names(res))
+res <- lapply (res, unname)
+
+empirical <- foreach(i = 1:1000, .inorder = FALSE) %do% {
+      tst <- lapply(res, function(x){sample(x, 1)})
+      sum(unlist(tst)) / length(tst)
+}
+
+hist(unlist(empirical))
+quantile(unlist(empirical), probs = c(0.025, 0.5, 0.975)) # middle 95% of data is between 37.27% and 38.45%
+mean(unlist(empirical))
+```
+
+# County-level
+First, some data exploration and setup. 
+```{r}
+library(data.table)
+library(readr)
+library(dplyr)
+library(tidyverse)
+
+df <- readRDS("../county_long.rds") |> filter(TAX_YEAR < 2020)
+top <- quantile(df$TotPerCapADJ, probs = c(0.99)) # will look for county,year pairs where the county had per capita damage in the top 1 percentile
+
+cols_to_keep <- c("TAX_YEAR", "geoid_2010", "TOT_REV", "TOT_EXP", "TOT_ASSET", "county_full", "state_name", "REGION", "DIVISION", "TotDmgADJ", "n_disasters", "TotPerCapADJ", "FEMA_threshADJ")
+
+df <- df |> select(all_of(cols_to_keep))
+
+df <- df |> mutate(topDamage = TotPerCapADJ >= top)
+sum(df$topDamage) # 905
+
+# counties are only eligible if at least one significant damage event occurred in their time series
+eligible_counties <- df |> filter(topDamage) |> select(geoid_2010) |> unique() |> pull() # 657 eligible counties
+df <- df |> filter(geoid_2010 %in% eligible_counties)
+
+# Determine if significant damage events (i.e. being in top 1 percentile) occur in consecutive years 
+df <- df |> group_by(geoid_2010) |> 
+      arrange(TAX_YEAR, .by_group = TRUE) |>
+      mutate(prev = lag(topDamage)) |>
+      ungroup()
+
+top_summary <- df |>
+      group_by(geoid_2010) |>
+      filter(topDamage) |>
+      summarise(n_top = sum(topDamage),
+                n_consecutive = sum(prev))
+
+table(top_summary$n_top) # 492 counties with 1 change point, 113 with 2, 52 with 3 or more
+table(top_summary$n_consecutive) # 615 with no consecutive, 37 with 1 or 2 consecutive
+sum(is.na(df |> filter(topDamage) |> select(prev))) # 5; all due to being at beginning of time series
+df |> filter(topDamage & is.na(prev) & TAX_YEAR != 1991) # 1 county whose time series began after 1991
+
+####### 
+# Old code looking at gaps and choosing candidates based on there being enough buffer around
+# Determine gaps between significant damage events
+# gaps <- df |> group_by(geoid_2010) |>
+#       select(TAX_YEAR, geoid_2010, top10damage) |>
+#       mutate(min_year = min(TAX_YEAR),
+#              max_year = max(TAX_YEAR)) |>
+#       filter(top10damage) |>
+#       mutate(gap_before = if_else(is.na(TAX_YEAR-lag(TAX_YEAR)), TAX_YEAR-min_year, TAX_YEAR-lag(TAX_YEAR)-1),
+#              gap_after = if_else(is.na(lead(TAX_YEAR)-TAX_YEAR), max_year-TAX_YEAR, lead(TAX_YEAR)-TAX_YEAR-1))
+# 
+# sum(gaps$gap_before >= 5 & gaps$gap_after >= 5) # 1580 
+# 
+# sum(gaps$gap_before >= 4 & gaps$gap_after >= 4) # 2203
+# 
+# sum(gaps$gap_before >= 5 & gaps$gap_after >= 4) # 1826 -- since including change point in second set, still get 5 points "after"
+# 
+# eligible_counties <- gaps |> filter(gap_before >= 5 & gap_after >= 4) |> select(geoid_2010) |> unique() |> pull() # 1507
+#
+# top_summary |> filter(geoid_2010 %in% eligible_counties) |> select(n_top) |> pull() |> table()
+# 
+# top_summary |> filter(geoid_2010 %in% eligible_counties) |> select(n_consecutive) |> pull() |> table() 
+# 
+# df <- df |> filter(geoid_2010 %in% eligible_counties) |>
+#       merge(gaps |> mutate(candidate_change_pt = (gap_before >= 5 & gap_after >= 4)) |> 
+#       select(TAX_YEAR, geoid_2010, candidate_change_pt),
+#       by = c("TAX_YEAR", "geoid_2010"), all.x = TRUE) |>
+#       arrange(geoid_2010,TAX_YEAR)
+# 
+# df <- df |> mutate(candidate_change_pt = replace_na(candidate_change_pt,FALSE))
+# 
+# df |> group_by(geoid_2010) |> summarize(n_change_pts = sum(candidate_change_pt)) |> select(n_change_pts) |> pull() |> table() # 1209 with 1, 278 with 2, 19 with 3, 1 with 4
+#######
+
+# keep only the time series with one candidate change point
+eligible_counties <- top_summary |> filter(n_top == 1) |> select(geoid_2010) |> pull() # 492
+df <- df |> filter(geoid_2010 %in% eligible_counties)
+
+gaps <- df |> group_by(geoid_2010) |>
+      select(TAX_YEAR, geoid_2010, topDamage) |>
+      mutate(min_year = min(TAX_YEAR),
+             max_year = max(TAX_YEAR)) |>
+      filter(topDamage) |>
+      mutate(gap_before = TAX_YEAR-min_year, gap_after = max_year-TAX_YEAR)
+
+# Keep only candidates that are not too close to the beginning or end of their time series
+# TODO: to really catch the right buffer length I also need to check that there actually exist 5 data points before and 4 after; currently we check the distance between the minimum and maximum year but if there is missing data in between then it would not be equivalent
+eligible_counties <- gaps |> filter(gap_before >= 5 & gap_after >= 4) |> pull(geoid_2010)
+
+df <- df |> filter(geoid_2010 %in% eligible_counties)
+# saveRDS(eligible_counties, "top1counties.rds")
+```
+
+## Multiple Candidates
+```{r}
+for (idx in seq(length(candidate))) { 
+      # Determine the left and right time series corresponding to the current candidate change point
+      if (length(candidate) == 1){ # only a single candidate point
+            left_years <- all_years[1:which(all_years == candidate)-1]
+            right_years <- all_years[which(all_years == candidate):length(all_years)]
+      } else if (idx == 1){ # more than one candidate point, this is the first
+            # TODO: for this & remaining cases need to replace candidate[idx] with which(all_years == candidate[idx])
+            # left data points
+            left_years <- all_years[1:candidate[1]-1]
+            right_years <- all_years[candidate[1]:(candidate[2]-1)]
+      } else if (idx == length(candidate)) { # more than one candidate point, this is the last
+            left_years <- all_years[candidate[idx-1]:(candidate[idx]-1)]
+            right_years <- all_years[candidate[idx]:length(all_years)]
+      } else { # more than one candidate point, this is the first, this is in the middle
+            left_years <- all_years[candidate[idx-1]:(candidate[idx]-1)]
+            right_years <- all_years[candidate[idx]:(candidate[idx+1]-1)]
+      }
+}
+```
+
+## Hyperparameter Optimization
+
+### Single county, single change point
+```{r}
+library(fields)
+library(mvtnorm)
+source("helper.R")
+
+# distance matrix of years
+dist_mat_all <- as.matrix(dist(sort(unique(df$TAX_YEAR) - min(df$TAX_YEAR) + 1), diag=TRUE, upper=TRUE))
+
+countyID <- "01061"
+
+# pull their time series
+my_data <- df |> filter(geoid_2010 == countyID) |>
+      mutate(TOT_REV = log1p(TOT_REV),
+             TOT_EXP = log1p(TOT_EXP),
+             TOT_ASSET = log1p(TOT_ASSET))
+min_year <- min(my_data$TAX_YEAR)
+all_years <- my_data$TAX_YEAR - min_year + 1 # all the years we have data for this county
+log_rev <- my_data$TOT_REV
+
+candidate <- (my_data  |> filter(topDamage) |> select(TAX_YEAR) |> pull()) - min_year + 1
+left_years <- all_years[1:candidate-1]
+right_years <- all_years[candidate:length(all_years)]
+combos <- expand.grid(nu = seq(from = 0.01, to = 3, by = 0.1196), 
+                      nugget = seq(from = 0, to = 3, by = 0.15))
+
+### Null Model ###
+curr_all_years <- c(left_years, right_years)
+centered_rev <- log_rev[curr_all_years] - mean(log_rev[curr_all_years])
+dist_mat <- dist_mat_all[curr_all_years, curr_all_years]
+dist_mat <- (dist_mat - min(dist_mat)) / (max(dist_mat) - min(dist_mat))
+
+# grid search (if doing Nelder-Mead, multiply get_likelihood_sigma by -1)
+likelihood_wrapper.null <- function(pars.vec){
+      return(get_likelihood_sigma(row = pars.vec,
+                                       dist_mat = dist_mat,
+                                       rho = 1,
+                                       data = centered_rev))
+}
+
+likelihoods.null <- apply(combos, MARGIN = 1, likelihood_wrapper.null)
+tst <- as.data.frame(list(nu = combos$nu, nugget = combos$nugget, likelihood = likelihoods.null))
+
+best_parameters.null <- setNames(data.frame(matrix(ncol = 3, nrow = 0)), c("ID", "nu", "nugget"))
+best_parameters.null <- rbind(best_parameters.null, 
+                              as.data.frame(list(geoid = countyID,
+                                                 nu = tst[which.max(tst$likelihood),]$nu,
+                                                 nugget = tst[which.max(tst$likelihood),]$nugget)))
+
+### Alternative Model ###
+
+# Left
+centered_rev.L <- log_rev[left_years] - mean(log_rev[left_years])
+dist_mat.L <- dist_mat_all[left_years, left_years]
+dist_mat.L <- (dist_mat.L - min(dist_mat.L)) / (max(dist_mat.L) - min(dist_mat.L))
+
+likelihood_wrapper.left <- function(pars.vec){
+      return(get_likelihood_sigma(row = pars.vec,
+                                       dist_mat = dist_mat.L,
+                                       rho = 1,
+                                       data = centered_rev.L))
+}
+
+likelihoods.L <- apply(combos, MARGIN = 1, likelihood_wrapper.left)
+tst <- as.data.frame(list(nu = combos$nu, nugget = combos$nugget, likelihood = likelihoods.L))
+
+best_parameters.L <- setNames(data.frame(matrix(ncol = 3, nrow = 0)), c("ID", "nu", "nugget"))
+best_parameters.L <- rbind(best_parameters.L, 
+                              as.data.frame(list(geoid = countyID,
+                                                 nu = tst[which.max(tst$likelihood),]$nu,
+                                                 nugget = tst[which.max(tst$likelihood),]$nugget)))
+
+# Right
+centered_rev.R <- log_rev[right_years] - mean(log_rev[right_years])
+dist_mat.R <- dist_mat_all[right_years, right_years]
+dist_mat.R <- (dist_mat.R - min(dist_mat.R)) / (max(dist_mat.R) - min(dist_mat.R))
+
+likelihood_wrapper.right <- function(pars.vec){
+      return(get_likelihood_sigma(row = pars.vec,
+                                       dist_mat = dist_mat.R,
+                                       rho = 1,
+                                       data = centered_rev.R))
+}
+
+likelihoods.R <- apply(combos, MARGIN = 1, likelihood_wrapper.right)
+tst <- as.data.frame(list(nu = combos$nu, nugget = combos$nugget, likelihood = likelihoods.R))
+
+best_parameters.R <- setNames(data.frame(matrix(ncol = 3, nrow = 0)), c("ID", "nu", "nugget"))
+best_parameters.R <- rbind(best_parameters.R, 
+                              as.data.frame(list(geoid = countyID,
+                                                 nu = tst[which.max(tst$likelihood),]$nu,
+                                                 nugget = tst[which.max(tst$likelihood),]$nugget)))
+saveRDS(best_parameters.null, "best_null.rds")
+saveRDS(best_parameters.L, "best_L.rds")
+saveRDS(best_parameters.R, "best_R.rds")
+```
+
+### Multiple counties, single change point - Grid Search w/ 50 counties
+```{r}
+library(data.table)
+library(readr)
+library(dplyr)
+library(tidyverse)
+library(fields)
+library(mvtnorm)
+source("helper.R")
+
+df <- readRDS("../county_long.rds") |> 
+      filter(TAX_YEAR < 2020) |> 
+      select(all_of(c("TAX_YEAR", "geoid_2010", "TOT_REV", "TOT_EXP", "TOT_ASSET", "county_full", "state_name", "REGION", "DIVISION", "TotDmgADJ", "n_disasters", "TotPerCapADJ", "FEMA_threshADJ")))
+
+top <- quantile(df$TotPerCapADJ, probs = c(0.99)) # will look for county,year pairs where the county had per capita damage in the top 1 percentile
+df <- df |> mutate(topDamage = TotPerCapADJ >= top)
+
+# distance matrix of years
+dist_mat_all <- as.matrix(dist(sort(unique(df$TAX_YEAR) - min(df$TAX_YEAR) + 1), diag=TRUE, upper=TRUE))
+
+eligible_counties <- readRDS("top1counties.rds")
+eligible_counties <- sample(eligible_counties, size = 50)
+
+combos <- expand.grid(nu = seq(from = 0.01, to = 3, by = 0.07475), 
+                      nugget = seq(from = 0, to = 3, by = 0.1))
+
+best_parameters.null <- setNames(data.frame(matrix(ncol = 3, nrow = 0)), c("ID", "nu", "nugget"))
+best_parameters.L <- setNames(data.frame(matrix(ncol = 3, nrow = 0)), c("ID", "nu", "nugget"))
+best_parameters.R <- setNames(data.frame(matrix(ncol = 3, nrow = 0)), c("ID", "nu", "nugget"))
+for (countyID in eligible_counties) {
+      # pull their time series
+      my_data <- df |> filter(geoid_2010 == countyID) |>
+            mutate(TOT_REV = log1p(TOT_REV),
+                   TOT_EXP = log1p(TOT_EXP),
+                   TOT_ASSET = log1p(TOT_ASSET))
+      all_years <- my_data$TAX_YEAR - min(df$TAX_YEAR) + 1 # all the years we have data for this county
+      log_rev <- my_data |> merge(data.frame(TAX_YEAR = 1991:2019), all = TRUE) |> arrange(TAX_YEAR) |> pull(TOT_REV)
+      
+      candidate <- (my_data  |> filter(topDamage) |> select(TAX_YEAR) |> pull()) - min(df$TAX_YEAR) + 1
+      left_years <- all_years[1:which(all_years == candidate)-1]
+      right_years <- all_years[which(all_years == candidate):length(all_years)]
+      
+      ### Null Model ###
+      curr_all_years <- c(left_years, right_years)
+      centered_rev <- log_rev[curr_all_years] - mean(log_rev[curr_all_years])
+      dist_mat <- dist_mat_all[curr_all_years, curr_all_years]
+      dist_mat <- (dist_mat - min(dist_mat)) / (max(dist_mat) - min(dist_mat))
+      
+      # grid search (if doing Nelder-Mead, multiply get_likelihood_sigma by -1)
+      likelihood_wrapper.null <- function(pars.vec){
+            return(get_likelihood_sigma(row = pars.vec,
+                                             dist_mat = dist_mat,
+                                             rho = 1,
+                                             data = centered_rev))
+      }
+      
+      likelihoods.null <- apply(combos, MARGIN = 1, likelihood_wrapper.null)
+      tst <- as.data.frame(list(nu = combos$nu, nugget = combos$nugget, likelihood = likelihoods.null))
+      best_parameters.null <- rbind(best_parameters.null, 
+                                    as.data.frame(list(geoid = countyID,
+                                                       nu = tst[which.max(tst$likelihood),]$nu,
+                                                       nugget = tst[which.max(tst$likelihood),]$nugget)))
+      
+      ### Alternative Model ###
+      
+      # Left
+      centered_rev.L <- log_rev[left_years] - mean(log_rev[left_years])
+      dist_mat.L <- dist_mat_all[left_years, left_years]
+      dist_mat.L <- (dist_mat.L - min(dist_mat.L)) / (max(dist_mat.L) - min(dist_mat.L))
+      
+      likelihood_wrapper.left <- function(pars.vec){
+            return(get_likelihood_sigma(row = pars.vec,
+                                             dist_mat = dist_mat.L,
+                                             rho = 1,
+                                             data = centered_rev.L))
+      }
+      
+      likelihoods.L <- apply(combos, MARGIN = 1, likelihood_wrapper.left)
+      tst <- as.data.frame(list(nu = combos$nu, nugget = combos$nugget, likelihood = likelihoods.L))
+      best_parameters.L <- rbind(best_parameters.L, 
+                                    as.data.frame(list(geoid = countyID,
+                                                       nu = tst[which.max(tst$likelihood),]$nu,
+                                                       nugget = tst[which.max(tst$likelihood),]$nugget)))
+      
+      # Right
+      centered_rev.R <- log_rev[right_years] - mean(log_rev[right_years])
+      dist_mat.R <- dist_mat_all[right_years, right_years]
+      dist_mat.R <- (dist_mat.R - min(dist_mat.R)) / (max(dist_mat.R) - min(dist_mat.R))
+      
+      likelihood_wrapper.right <- function(pars.vec){
+            return(get_likelihood_sigma(row = pars.vec,
+                                             dist_mat = dist_mat.R,
+                                             rho = 1,
+                                             data = centered_rev.R))
+      }
+      
+      likelihoods.R <- apply(combos, MARGIN = 1, likelihood_wrapper.right)
+      tst <- as.data.frame(list(nu = combos$nu, nugget = combos$nugget, likelihood = likelihoods.R))
+      best_parameters.R <- rbind(best_parameters.R, 
+                                    as.data.frame(list(geoid = countyID,
+                                                       nu = tst[which.max(tst$likelihood),]$nu,
+                                                       nugget = tst[which.max(tst$likelihood),]$nugget)))
+}
+
+all_best <- rbind(best_parameters.null, best_parameters.L, best_parameters.R) |> select(nu,nugget)
+cl <- kmeans(all_best, 5, iter.max = 20, nstart = 3)
+saveRDS(cl, "init_conds_50.rds")
+# saveRDS(best_parameters.null, "best_null.rds")
+# saveRDS(best_parameters.L, "best_L.rds")
+# saveRDS(best_parameters.R, "best_R.rds")
+```
+
+### Multiple counties, single change point - Nelder-Mead with all counties
+```{r}
+library(data.table)
+library(readr)
+library(dplyr)
+library(tidyverse)
+library(fields)
+library(mvtnorm)
+source("helper.R")
+
+df <- readRDS("county_long.rds") |> 
+      filter(TAX_YEAR < 2020) |> 
+      select(all_of(c("TAX_YEAR", "geoid_2010", "TOT_REV", "TOT_EXP", "TOT_ASSET", "county_full", "state_name", "REGION", "DIVISION", "TotDmgADJ", "n_disasters", "TotPerCapADJ", "FEMA_threshADJ")))
+
+top <- quantile(df$TotPerCapADJ, probs = c(0.99)) # will look for county,year pairs where the county had per capita damage in the top 1 percentile
+df <- df |> mutate(topDamage = TotPerCapADJ >= top)
+
+# distance matrix of years
+dist_mat_all <- as.matrix(dist(sort(unique(df$TAX_YEAR) - min(df$TAX_YEAR) + 1), diag=TRUE, upper=TRUE))
+
+eligible_counties <- readRDS("top1counties.rds")
+df <- df |> filter(geoid_2010 %in% eligible_counties)
+init_conds <- readRDS("init_conds_50.rds")$centers
+
+best_parameters.null <- setNames(data.frame(matrix(ncol = 3, nrow = 0)), c("ID", "nu", "nugget"))
+best_parameters.L <- setNames(data.frame(matrix(ncol = 3, nrow = 0)), c("ID", "nu", "nugget"))
+best_parameters.R <- setNames(data.frame(matrix(ncol = 3, nrow = 0)), c("ID", "nu", "nugget"))
+
+errs <- c()
+for (countyID in eligible_counties) {
+      print(countyID)
+      # pull their time series
+      my_data <- df |> filter(geoid_2010 == countyID) |>
+            mutate(TOT_REV = log1p(TOT_REV),
+                   TOT_EXP = log1p(TOT_EXP),
+                   TOT_ASSET = log1p(TOT_ASSET))
+      all_years <- my_data$TAX_YEAR - min(df$TAX_YEAR) + 1 # all the years we have data for this county
+      log_rev <- my_data |> merge(data.frame(TAX_YEAR = 1991:2019), all = TRUE) |> arrange(TAX_YEAR) |> pull(TOT_REV)
+      
+      candidate <- (my_data  |> filter(topDamage) |> select(TAX_YEAR) |> pull()) - min(df$TAX_YEAR) + 1
+      left_years <- all_years[1:which(all_years == candidate)-1]
+      right_years <- all_years[which(all_years == candidate):length(all_years)]
+      
+      ### Null Model ###
+      curr_all_years <- c(left_years, right_years)
+      centered_rev <- log_rev[curr_all_years] - mean(log_rev[curr_all_years])
+      dist_mat <- dist_mat_all[curr_all_years, curr_all_years]
+      dist_mat <- (dist_mat - min(dist_mat)) / (max(dist_mat) - min(dist_mat))
+      
+      likelihood_wrapper.null <- function(pars.vec){
+            return(-1 * get_likelihood_sigma(row = pars.vec,
+                                             dist_mat = dist_mat,
+                                             rho = 1,
+                                             data = centered_rev))
+      }
+      
+      tst <- setNames(data.frame(matrix(ncol = 6, nrow = 0)), c("nu.init", "nugg.init", "nu", "nugget", "likelihood", "trial"))
+i <- 2      
+      for (i in 1:nrow(init_conds)){
+            res <- constrOptim(theta = init_conds[i,], 
+                               f = likelihood_wrapper.null,
+                               grad = NULL,
+                               ui = rbind(c(1,0),c(-1,0),c(0,1)), #rbind(c(1,0),c(-1,0),c(0,1))
+                               ci = c(0.001,-3.5,0)) #c(0.001,-3.5, 0)
+            tst[nrow(tst)+1,] <- c(c(init_conds[i,1], init_conds[i,2], res$par[1], res$par[2], -1*res$value, i))
+      }
+
+      best_parameters.null <- rbind(best_parameters.null, 
+                                    as.data.frame(list(geoid = countyID,
+                                                       nu = tst[which.max(tst$likelihood),]$nu,
+                                                       nugget = tst[which.max(tst$likelihood),]$nugget)))
+      
+      ### Alternative Model ###
+      
+      # Left
+      centered_rev.L <- log_rev[left_years] - mean(log_rev[left_years])
+      if (var(centered_rev.L) == 0){
+            errs <- c(errs, countyID)
+            next
+            }
+      dist_mat.L <- dist_mat_all[left_years, left_years]
+      dist_mat.L <- (dist_mat.L - min(dist_mat.L)) / (max(dist_mat.L) - min(dist_mat.L))
+      
+      likelihood_wrapper.left <- function(pars.vec){
+            return(-1 * get_likelihood_sigma(row = pars.vec,
+                                             dist_mat = dist_mat.L,
+                                             rho = 1,
+                                             data = centered_rev.L))
+      }
+      
+      tst <- setNames(data.frame(matrix(ncol = 6, nrow = 0)), c("nu.init", "nugg.init", "nu", "nugget", "likelihood", "trial"))
+      for (i in 1:nrow(init_conds)){
+            res <- constrOptim(theta = init_conds[i,], 
+                               f = likelihood_wrapper.left,
+                               grad = NULL,
+                               ui = rbind(c(1,0),c(-1,0),c(0,1)), #rbind(c(1,0),c(-1,0),c(0,1))
+                               ci = c(0.001,-3.5,0)) #c(0.001,-3.5, 0)
+            tst[nrow(tst)+1,] <- c(c(init_conds[i,1], init_conds[i,2], res$par[1], res$par[2], -1*res$value, i))
+      }
+      best_parameters.L <- rbind(best_parameters.L, 
+                                    as.data.frame(list(geoid = countyID,
+                                                       nu = tst[which.max(tst$likelihood),]$nu,
+                                                       nugget = tst[which.max(tst$likelihood),]$nugget)))
+      
+      # Right
+      centered_rev.R <- log_rev[right_years] - mean(log_rev[right_years])
+      if (var(centered_rev.R) == 0){
+            errs <- c(errs, countyID)
+            next
+            }
+      dist_mat.R <- dist_mat_all[right_years, right_years]
+      dist_mat.R <- (dist_mat.R - min(dist_mat.R)) / (max(dist_mat.R) - min(dist_mat.R))
+      
+      likelihood_wrapper.right <- function(pars.vec){
+            return(-1 * get_likelihood_sigma(row = pars.vec,
+                                             dist_mat = dist_mat.R,
+                                             rho = 1,
+                                             data = centered_rev.R))
+      }
+      
+      tst <- setNames(data.frame(matrix(ncol = 6, nrow = 0)), c("nu.init", "nugg.init", "nu", "nugget", "likelihood", "trial"))
+      for (i in 1:nrow(init_conds)){
+            res <- constrOptim(theta = init_conds[i,], 
+                               f = likelihood_wrapper.right,
+                               grad = NULL,
+                               ui = rbind(c(1,0),c(-1,0),c(0,1)), #rbind(c(1,0),c(-1,0),c(0,1))
+                               ci = c(0.001,-3.5,0)) #c(0.001,-3.5, 0)
+            tst[nrow(tst)+1,] <- c(c(init_conds[i,1], init_conds[i,2], res$par[1], res$par[2], -1*res$value, i))
+      }
+      best_parameters.R <- rbind(best_parameters.R, 
+                                    as.data.frame(list(geoid = countyID,
+                                                       nu = tst[which.max(tst$likelihood),]$nu,
+                                                       nugget = tst[which.max(tst$likelihood),]$nugget)))
+
+}
+
+saveRDS(best_parameters.null, "best_null.rds")
+saveRDS(best_parameters.L, "best_L.rds")
+saveRDS(best_parameters.R, "best_R.rds")
+
+```
+
+
+```{r}
+library(data.table)
+library(readr)
+library(dplyr)
+library(tidyverse)
+library(fields)
+library(mvtnorm)
+
+df <- readRDS("county_long.rds") |> 
+      filter(TAX_YEAR < 2020) |> 
+      select(all_of(c("TAX_YEAR", "geoid_2010", "TOT_REV", "TOT_EXP", "TOT_ASSET", "county_full", "state_name", "REGION", "DIVISION", "TotDmgADJ", "n_disasters", "TotPerCapADJ", "FEMA_threshADJ")))
+
+top <- quantile(df$TotPerCapADJ, probs = c(0.99)) # will look for county,year pairs where the county had per capita damage in the top 1 percentile
+df <- df |> mutate(topDamage = TotPerCapADJ >= top)
+
+# distance matrix of years
+dist_mat_all <- as.matrix(dist(sort(unique(df$TAX_YEAR) - min(df$TAX_YEAR) + 1), diag=TRUE, upper=TRUE))
+
+init_conds <- readRDS("init_conds_50.rds")$centers
+countyID <- "21223" # "13061", "28143", "48431"
+
+my_data <- df |> filter(geoid_2010 == countyID) |>
+      mutate(TOT_REV = log1p(TOT_REV),
+             TOT_EXP = log1p(TOT_EXP),
+             TOT_ASSET = log1p(TOT_ASSET))
+# min_year <- min(my_data$TAX_YEAR)
+all_years <- my_data$TAX_YEAR - 1991 + 1 # all the years we have data for this county
+
+candidate <- (my_data  |> filter(topDamage) |> select(TAX_YEAR) |> pull()) - 1991 + 1
+left_years <- all_years[1:which(all_years == candidate)-1]
+right_years <- all_years[which(all_years == candidate):length(all_years)]
+
+log_rev <- my_data |> merge(data.frame(TAX_YEAR = 1991:2019), all = TRUE) |> arrange(TAX_YEAR) |> pull(TOT_REV)
+
+curr_all_years <- c(left_years, right_years)
+centered_rev <- log_rev[curr_all_years] - mean(log_rev[curr_all_years])
+dist_mat <- dist_mat_all[curr_all_years, curr_all_years]
+dist_mat <- (dist_mat - min(dist_mat)) / (max(dist_mat) - min(dist_mat))
+
+i <- 1
+mat_cov <- Matern(d = dist_mat, smoothness = init_conds[i,1], range = 1, phi = 1) + diag(init_conds[i,1], dim(dist_mat)[1])
+
+# Compute sigma^2
+sigma.squared <- (1/length(centered_rev)) * (centered_rev %*% chol2inv(chol(mat_cov)) %*% centered_rev)[1,1]
+
+# Compute likelihood
+likelihood <- dmvnorm(centered_rev,
+                      mean = rep(0, length(centered_rev)),
+                      sigma = sigma.squared * mat_cov,
+                      log = TRUE)
+
+centered_rev.L <- log_rev[left_years] - mean(log_rev[left_years])
+dist_mat.L <- dist_mat_all[left_years, left_years]
+dist_mat.L <- (dist_mat.L - min(dist_mat.L)) / (max(dist_mat.L) - min(dist_mat.L))
+
+centered_rev.R <- log_rev[right_years] - mean(log_rev[right_years])
+dist_mat.R <- dist_mat_all[right_years, right_years]
+dist_mat.R <- (dist_mat.R - min(dist_mat.R)) / (max(dist_mat.R) - min(dist_mat.R))
+
+mat_cov <- Matern(d = dist_mat.R, smoothness = init_conds[i,1], range = 1, phi = 1) + diag(init_conds[i,1], dim(dist_mat.R)[1])
+
+# Compute sigma^2
+sigma.squared <- (1/length(centered_rev.R)) * (centered_rev.R %*% chol2inv(chol(mat_cov)) %*% centered_rev.R)[1,1]
+
+# Compute likelihood
+likelihood <- dmvnorm(centered_rev.R,
+                      mean = rep(0, length(centered_rev.R)),
+                      sigma = sigma.squared * mat_cov,
+                      log = TRUE)
+```
+
+## LRT
+```{r}
+library(data.table)
+library(readr)
+library(dplyr)
+library(tidyverse)
+library(fields)
+library(mvtnorm)
+
+eligible_counties <- readRDS("top1counties.rds")
+df <- readRDS("county_long.rds") |> 
+      filter(TAX_YEAR < 2020) |> 
+      select(all_of(c("TAX_YEAR", "geoid_2010", "TOT_REV", "TOT_EXP", "TOT_ASSET", "county_full", "state_name", "REGION", "DIVISION", "TotDmgADJ", "n_disasters", "TotPerCapADJ", "FEMA_threshADJ")))
+
+top <- quantile(df$TotPerCapADJ, probs = c(0.99)) # will look for county,year pairs where the county had per capita damage in the top 1 percentile
+df <- df |> mutate(topDamage = TotPerCapADJ >= top) |> filter(geoid_2010 %in% eligible_counties)
+
+# distance matrix of years
+dist_mat_all <- as.matrix(dist(sort(unique(df$TAX_YEAR) - min(df$TAX_YEAR) + 1), diag=TRUE, upper=TRUE))
+
+best_all.null <- readRDS("best_null.rds")
+best_all.L <- readRDS("best_L.rds")
+best_all.R <- readRDS("best_R.rds")
+rho = 1
+
+reject_null <- list()
+for (my_county in eligible_counties) {
+      if (my_county == "21223"){ # this was one case where left was all 0s
+            next
+      }
+      # pull their time series
+      my_data <- df |> filter(geoid_2010 == my_county) |>
+            mutate(TOT_REV = log1p(TOT_REV),
+                   TOT_EXP = log1p(TOT_EXP),
+                   TOT_ASSET = log1p(TOT_ASSET))
+      all_years <- my_data$TAX_YEAR - min(df$TAX_YEAR) + 1 # all the years we have data for this county
+      log_rev <- my_data |> merge(data.frame(TAX_YEAR = 1991:2019), all = TRUE) |> arrange(TAX_YEAR) |> pull(TOT_REV)
+      
+      candidate <- (my_data  |> filter(topDamage) |> select(TAX_YEAR) |> pull()) - min(df$TAX_YEAR) + 1
+      
+      # pull best parameters
+      best.null <- best_all.null |> filter(geoid == my_county)
+      best.L <- best_all.L |> filter(geoid == my_county)
+      best.R <- best_all.R |> filter(geoid == my_county)
+      
+
+      # Determine the left and right time series corresponding to the current candidate change point
+      left_years <- all_years[1:which(all_years == candidate)-1]
+      right_years <- all_years[which(all_years == candidate):length(all_years)]
+      
+      ### Null Hypothesis Model ###
+      curr_all_years <- c(left_years, right_years) # Redundant for single candidate
+      centered_rev <- log_rev[curr_all_years] - mean(log_rev[curr_all_years]) # center the log revenue values so they are mean 0
+      
+      dist_mat <- dist_mat_all[curr_all_years, curr_all_years]
+      dist_mat <- (dist_mat - min(dist_mat)) / (max(dist_mat) - min(dist_mat))
+      Sigma_0 <- Matern(d = dist_mat,
+                        smoothness = best.null$nu,
+                        range = rho,
+                        phi = 1) + diag(best.null$nugget, dim(dist_mat)[1])
+      
+      sigma.sqrd_0 <- (1/length(centered_rev)) * (centered_rev %*% chol2inv(chol(Sigma_0)) %*% centered_rev)[1,1]
+      Sigma_0 <- sigma.sqrd_0 * Sigma_0
+      
+      ### Alternative Hypothesis Model ###
+      # center the log revenue values so they are mean 0
+      centered_rev.L <- log_rev[left_years] - mean(log_rev[left_years])
+      centered_rev.R <- log_rev[right_years] - mean(log_rev[right_years])
+      
+      # compute and normalize distance matrices
+      dist_mat.L <- dist_mat_all[left_years, left_years]
+      dist_mat.L <- (dist_mat.L - min(dist_mat.L)) / (max(dist_mat.L) - min(dist_mat.L))
+      
+      dist_mat.R <- dist_mat_all[right_years, right_years]
+      dist_mat.R <- (dist_mat.R - min(dist_mat.R)) / (max(dist_mat.R) - min(dist_mat.R))
+      
+      # Compute Matern covariance matrices
+      Sigma_L <- Matern(d = dist_mat.L,
+                  smoothness = best.L$nu,
+                  range = rho,
+                  phi = 1) + diag(best.L$nugget, dim(dist_mat.L)[1])
+      sigma.sqrd_L <- (1/length(left_years)) * (centered_rev.L %*% chol2inv(chol(Sigma_L)) %*% centered_rev.L)[1,1]
+      Sigma_L <- sigma.sqrd_L * Sigma_L
+      
+      Sigma_R <- Matern(d = dist_mat.R,
+                  smoothness = best.R$nu,
+                  range = rho,
+                  phi = 1) + diag(best.R$nugget, dim(dist_mat.R)[1])
+      sigma.sqrd_R <- (1/length(right_years)) * (centered_rev.R %*% chol2inv(chol(Sigma_R)) %*% centered_rev.R)[1,1]
+      Sigma_R <- sigma.sqrd_R * Sigma_R
+      
+      ### Likelihood Ratio Test ###
+      L_0 <- dmvnorm(centered_rev, 
+                     mean = rep(0, length(centered_rev)), 
+                     sigma = Sigma_0,
+                     log = TRUE)
+      
+      L_left <- dmvnorm(centered_rev.L, 
+                        mean = rep(0, length(centered_rev.L)), 
+                        sigma = Sigma_L,
+                        log = TRUE)
+      
+      L_right <- dmvnorm(centered_rev.R, 
+                         mean = rep(0, length(centered_rev.R)), 
+                         sigma = Sigma_R,
+                         log = TRUE)
+      
+      L_alt <- L_left + L_right
+
+      
+      # likelihood ratio test statistic
+      lrt <- -2*L_0 + 2*L_alt
+      doF <- 4 #  (mu1, mu2, Sigma1, Sigma2, nu1, nu2, nugget1, nugget2) vs (mu, Sigma, nu, nugget) 
+      reject_null[my_county] <- (lrt > qchisq(p = 0.05, df = doF, lower.tail = FALSE))
+}
+# rm(list = setdiff(ls(), c("df", "eligible_counties", "gaps", "top_summary")))
+sum(unlist(reject_null)) / length(reject_null) # 57.04% of the time we have enough evidence to reject the null
+```
+
+
+# Empirical Distribution County-Level
+
+```{r}
+library(readr)
+library(dplyr)
+library(tidyverse)
+
+set.seed(2727)
+eligible_counties <- readRDS("top1counties.rds")
+df <- readRDS("county_long.rds") |> 
+      filter(TAX_YEAR < 2020) |> 
+      select(all_of(c("TAX_YEAR", "geoid_2010", "TOT_REV", "TOT_EXP", "TOT_ASSET", "county_full", "state_name", "REGION", "DIVISION", "TotDmgADJ", "n_disasters", "TotPerCapADJ", "FEMA_threshADJ"))) |>
+      filter(geoid_2010 %in% eligible_counties) |>
+      arrange(geoid_2010, TAX_YEAR)
+
+df <- df |> filter(geoid_2010 != "21223") |> 
+      group_by(geoid_2010) |>
+      mutate(n = n(),
+             row_num = row_number(),
+             eligible = (row_num > 5 & row_num <= n-4)) |> ungroup()
+
+candidates_all <- list()
+for (i in 1:50) {
+      candidates <- df |> group_by(geoid_2010) |>
+            filter(eligible) |>
+            slice_sample(n = 1) |>
+            select(geoid_2010, TAX_YEAR)
+      
+      candidates_list <- candidates |> pull(TAX_YEAR) |> as.list()
+      names(candidates_list) <- candidates |> pull(geoid_2010)
+      
+      candidates_all[[as.character(i)]] <- candidates_list
+}
+saveRDS(candidates_all, "random_candidates50.rds")
+
+# indices <- df |> mutate(idx = row_number()) |>
+#       group_by(geoid_2010) |>
+#       filter(eligible) |>
+#       slice_sample(n = 1) |>
+#       pull(idx)
+# 
+# df$candidate <- FALSE
+# df$candidate[indices] <- TRUE
+# df |> filter(candidate) |> pull(eligible) |> sum()
+# 
+# df <- df |> select(-n, row_num, eligible)
+# saveRDS(df, "empirical_df.rds")
+```
+
+## Hyperparameter Opt
+### Multiple counties, single change point - Grid Search w/ 50 counties
+```{r}
+library(data.table)
+library(readr)
+library(dplyr)
+library(tidyverse)
+library(fields)
+library(mvtnorm)
+source("helper.R")
+
+candidates_all <- readRDS("random_candidates50.rds")
+df <- readRDS("county_long.rds") |> 
+      filter(TAX_YEAR < 2020) |> 
+      select(all_of(c("TAX_YEAR", "geoid_2010", "TOT_REV", "TOT_EXP", "TOT_ASSET", "county_full", "state_name", "REGION", "DIVISION", "TotDmgADJ", "n_disasters", "TotPerCapADJ", "FEMA_threshADJ"))) |>
+      filter(geoid_2010 %in% names(candidates_all$`1`)) |>
+      arrange(geoid_2010, TAX_YEAR)
+
+# distance matrix of years
+dist_mat_all <- as.matrix(dist(sort(unique(df$TAX_YEAR) - min(df$TAX_YEAR) + 1), diag=TRUE, upper=TRUE))
+
+set.seed(2727)
+eligible_counties <- sample(unique(df$geoid_2010), size = 50)
+
+combos <- expand.grid(nu = seq(from = 0.01, to = 3, by = 0.07475), 
+                      nugget = seq(from = 0, to = 3, by = 0.1))
+
+best_parameters.null <- setNames(data.frame(matrix(ncol = 4, nrow = 0)), c("ID", "nu", "nugget", "trial"))
+best_parameters.L <- setNames(data.frame(matrix(ncol = 4, nrow = 0)), c("ID", "nu", "nugget", "trial"))
+best_parameters.R <- setNames(data.frame(matrix(ncol = 4, nrow = 0)), c("ID", "nu", "nugget", "trial"))
+
+for (countyID in eligible_counties) {
+      print(countyID)
+      # pull their time series
+      my_data <- df |> filter(geoid_2010 == countyID) |>
+            mutate(TOT_REV = log1p(TOT_REV),
+                   TOT_EXP = log1p(TOT_EXP),
+                   TOT_ASSET = log1p(TOT_ASSET))
+      all_years <- my_data$TAX_YEAR - min(df$TAX_YEAR) + 1 # all the years we have data for this county
+      log_rev <- my_data |> merge(data.frame(TAX_YEAR = 1991:2019), all = TRUE) |> arrange(TAX_YEAR) |> pull(TOT_REV)
+      
+      for (i in names(candidates_all)){
+            candidate <- candidates_all[[i]][[countyID]] - min(df$TAX_YEAR) + 1
+            left_years <- all_years[1:which(all_years == candidate)-1]
+            right_years <- all_years[which(all_years == candidate):length(all_years)]
+            
+            ### Null Model ###
+            curr_all_years <- c(left_years, right_years)
+            centered_rev <- log_rev[curr_all_years] - mean(log_rev[curr_all_years])
+            dist_mat <- dist_mat_all[curr_all_years, curr_all_years]
+            dist_mat <- (dist_mat - min(dist_mat)) / (max(dist_mat) - min(dist_mat))
+            
+            # grid search (if doing Nelder-Mead, multiply get_likelihood_sigma by -1)
+            likelihood_wrapper.null <- function(pars.vec){
+                  return(get_likelihood_sigma(row = pars.vec,
+                                                   dist_mat = dist_mat,
+                                                   rho = 1,
+                                                   data = centered_rev))
+            }
+            
+            likelihoods.null <- apply(combos, MARGIN = 1, likelihood_wrapper.null)
+            tst <- as.data.frame(list(nu = combos$nu, nugget = combos$nugget, likelihood = likelihoods.null))
+            best_parameters.null <- rbind(best_parameters.null, 
+                                          as.data.frame(list(geoid = countyID,
+                                                             nu = tst[which.max(tst$likelihood),]$nu,
+                                                             nugget = tst[which.max(tst$likelihood),]$nugget,
+                                                             trial = i)))
+            
+            ### Alternative Model ###
+            
+            # Left
+            centered_rev.L <- log_rev[left_years] - mean(log_rev[left_years])
+            dist_mat.L <- dist_mat_all[left_years, left_years]
+            dist_mat.L <- (dist_mat.L - min(dist_mat.L)) / (max(dist_mat.L) - min(dist_mat.L))
+            
+            likelihood_wrapper.left <- function(pars.vec){
+                  return(get_likelihood_sigma(row = pars.vec,
+                                                   dist_mat = dist_mat.L,
+                                                   rho = 1,
+                                                   data = centered_rev.L))
+            }
+            
+            likelihoods.L <- apply(combos, MARGIN = 1, likelihood_wrapper.left)
+            tst <- as.data.frame(list(nu = combos$nu, nugget = combos$nugget, likelihood = likelihoods.L))
+            best_parameters.L <- rbind(best_parameters.L, 
+                                          as.data.frame(list(geoid = countyID,
+                                                             nu = tst[which.max(tst$likelihood),]$nu,
+                                                             nugget = tst[which.max(tst$likelihood),]$nugget,
+                                                             trial = i)))
+            
+            # Right
+            centered_rev.R <- log_rev[right_years] - mean(log_rev[right_years])
+            dist_mat.R <- dist_mat_all[right_years, right_years]
+            dist_mat.R <- (dist_mat.R - min(dist_mat.R)) / (max(dist_mat.R) - min(dist_mat.R))
+            
+            likelihood_wrapper.right <- function(pars.vec){
+                  return(get_likelihood_sigma(row = pars.vec,
+                                                   dist_mat = dist_mat.R,
+                                                   rho = 1,
+                                                   data = centered_rev.R))
+            }
+            
+            likelihoods.R <- apply(combos, MARGIN = 1, likelihood_wrapper.right)
+            tst <- as.data.frame(list(nu = combos$nu, nugget = combos$nugget, likelihood = likelihoods.R))
+            best_parameters.R <- rbind(best_parameters.R, 
+                                          as.data.frame(list(geoid = countyID,
+                                                             nu = tst[which.max(tst$likelihood),]$nu,
+                                                             nugget = tst[which.max(tst$likelihood),]$nugget,
+                                                             trial = i)))
+      }
+}
+
+# TODO: should I do kmeans clustering per trial or just overall? for now just overall but ask team
+all_best <- rbind(best_parameters.null, best_parameters.L, best_parameters.R) |> select(nu,nugget)
+cl <- kmeans(all_best, 5, iter.max = 20, nstart = 3)
+# saveRDS(cl, "empirical_init_conds_50.rds")
+# cl$centers
+```
+
+### Multiple counties, single change point - Nelder-Mead with all counties
+```{r}
+library(data.table)
+library(readr)
+library(dplyr)
+library(tidyverse)
+library(fields)
+library(mvtnorm)
+library(doParallel)
+source("helper.R")
+
+candidates_all <- readRDS("random_candidates50.rds")
+df <- readRDS("county_long.rds") |> 
+      filter(TAX_YEAR < 2020) |> 
+      select(all_of(c("TAX_YEAR", "geoid_2010", "TOT_REV", "TOT_EXP", "TOT_ASSET", "county_full", "state_name", "REGION", "DIVISION", "TotDmgADJ", "n_disasters", "TotPerCapADJ", "FEMA_threshADJ"))) |>
+      filter(geoid_2010 %in% names(candidates_all$`1`)) |>
+      arrange(geoid_2010, TAX_YEAR)
+
+# distance matrix of years
+dist_mat_all <- as.matrix(dist(sort(unique(df$TAX_YEAR) - min(df$TAX_YEAR) + 1), diag=TRUE, upper=TRUE))
+
+init_conds <- readRDS("empirical_init_conds_50.rds")$centers
+
+best_parameters <- setNames(data.frame(matrix(ncol = 5, nrow = 0)), c("type", "geoid", "nu", "nugget", "trial"))
+
+errs <- c()
+combos <- expand.grid(unique(df$geoid_2010), as.character(1:length(candidates_all))) |> arrange(Var1, Var2)
+
+test_idx <- c(1:10, 51:60)
+resBest <- foreach(i = test_idx, .combine = 'rbind', .packages = c("dplyr", "fields", "mvtnorm"), .verbose = TRUE, .errorhandling = "remove") %do% {
+      countyID <- combos$Var1[i]
+      trialID <- combos$Var2[i]
+      print(paste("County ID:", countyID, "Trial Number:", trialID))
+      # pull their time series
+      my_data <- df |> filter(geoid_2010 == countyID) |>
+            mutate(TOT_REV = log1p(TOT_REV),
+                   TOT_EXP = log1p(TOT_EXP),
+                   TOT_ASSET = log1p(TOT_ASSET))
+      all_years <- my_data$TAX_YEAR - min(df$TAX_YEAR) + 1 # all the years we have data for this county
+      log_rev <- my_data |> merge(data.frame(TAX_YEAR = 1991:2019), all = TRUE) |> arrange(TAX_YEAR) |> pull(TOT_REV)
+      
+      candidate <- candidates_all[[trialID]][[countyID]] - min(df$TAX_YEAR) + 1
+      left_years <- all_years[1:which(all_years == candidate)-1]
+      right_years <- all_years[which(all_years == candidate):length(all_years)]
+      
+      ### Null Model ###
+      curr_all_years <- c(left_years, right_years)
+      centered_rev <- log_rev[curr_all_years] - mean(log_rev[curr_all_years])
+      dist_mat <- dist_mat_all[curr_all_years, curr_all_years]
+      dist_mat <- (dist_mat - min(dist_mat)) / (max(dist_mat) - min(dist_mat))
+      
+      likelihood_wrapper.null <- function(pars.vec){
+            return(-1 * get_likelihood_sigma(row = pars.vec,
+                                             dist_mat = dist_mat,
+                                             rho = 1,
+                                             data = centered_rev))
+      }
+      
+      tst <- setNames(data.frame(matrix(ncol = 6, nrow = 0)), c("nu.init", "nugg.init", "nu", "nugget", "likelihood", "trial"))
+i <- 2      
+      for (i in 1:nrow(init_conds)){
+            res <- constrOptim(theta = init_conds[i,], 
+                               f = likelihood_wrapper.null,
+                               grad = NULL,
+                               ui = rbind(c(1,0),c(-1,0),c(0,1)), #rbind(c(1,0),c(-1,0),c(0,1))
+                               ci = c(0.001,-3.5,0)) #c(0.001,-3.5, 0)
+            tst[nrow(tst)+1,] <- c(c(init_conds[i,1], init_conds[i,2], res$par[1], res$par[2], -1*res$value, i))
+      }
+      res.null <- as.data.frame(list(type = "null",
+                         geoid = countyID,
+                         nu = tst[which.max(tst$likelihood),]$nu,
+                         nugget = tst[which.max(tst$likelihood),]$nugget,
+                         trial = trialID))
+      
+      ### Alternative Model ###
+      
+      # Left
+      centered_rev.L <- log_rev[left_years] - mean(log_rev[left_years])
+      if (var(centered_rev.L) == 0){
+            cat(i, file = file.path("errors/", paste0(i, ".txt")))
+            }
+      dist_mat.L <- dist_mat_all[left_years, left_years]
+      dist_mat.L <- (dist_mat.L - min(dist_mat.L)) / (max(dist_mat.L) - min(dist_mat.L))
+      
+      likelihood_wrapper.left <- function(pars.vec){
+            return(-1 * get_likelihood_sigma(row = pars.vec,
+                                             dist_mat = dist_mat.L,
+                                             rho = 1,
+                                             data = centered_rev.L))
+      }
+      
+      tst <- setNames(data.frame(matrix(ncol = 6, nrow = 0)), c("nu.init", "nugg.init", "nu", "nugget", "likelihood", "trial"))
+      for (i in 1:nrow(init_conds)){
+            res <- constrOptim(theta = init_conds[i,], 
+                               f = likelihood_wrapper.left,
+                               grad = NULL,
+                               ui = rbind(c(1,0),c(-1,0),c(0,1)), #rbind(c(1,0),c(-1,0),c(0,1))
+                               ci = c(0.001,-3.5,0)) #c(0.001,-3.5, 0)
+            tst[nrow(tst)+1,] <- c(c(init_conds[i,1], init_conds[i,2], res$par[1], res$par[2], -1*res$value, i))
+      }
+      res.left <- as.data.frame(list(type = "left",
+                         geoid = countyID,
+                         nu = tst[which.max(tst$likelihood),]$nu,
+                         nugget = tst[which.max(tst$likelihood),]$nugget,
+                         trial = trialID))
+      
+      # Right
+      centered_rev.R <- log_rev[right_years] - mean(log_rev[right_years])
+      if (var(centered_rev.R) == 0){
+            cat(i, file = file.path("errors/", paste0(i, ".txt")))
+            }
+      dist_mat.R <- dist_mat_all[right_years, right_years]
+      dist_mat.R <- (dist_mat.R - min(dist_mat.R)) / (max(dist_mat.R) - min(dist_mat.R))
+      
+      likelihood_wrapper.right <- function(pars.vec){
+            return(-1 * get_likelihood_sigma(row = pars.vec,
+                                             dist_mat = dist_mat.R,
+                                             rho = 1,
+                                             data = centered_rev.R))
+      }
+      
+      tst <- setNames(data.frame(matrix(ncol = 6, nrow = 0)), c("nu.init", "nugg.init", "nu", "nugget", "likelihood", "trial"))
+      for (i in 1:nrow(init_conds)){
+            res <- constrOptim(theta = init_conds[i,], 
+                               f = likelihood_wrapper.right,
+                               grad = NULL,
+                               ui = rbind(c(1,0),c(-1,0),c(0,1)), #rbind(c(1,0),c(-1,0),c(0,1))
+                               ci = c(0.001,-3.5,0)) #c(0.001,-3.5, 0)
+            tst[nrow(tst)+1,] <- c(c(init_conds[i,1], init_conds[i,2], res$par[1], res$par[2], -1*res$value, i))
+      }
+      rbind(res.null,
+            res.left,
+            as.data.frame(list(type = "right",
+                         geoid = countyID,
+                         nu = tst[which.max(tst$likelihood),]$nu,
+                         nugget = tst[which.max(tst$likelihood),]$nugget,
+                         trial = trialID)))
+
+}
+
+saveRDS(resBest, "empirical_best_test.rds")
+
+```
+
+
+```{r}
+library(data.table)
+library(readr)
+library(dplyr)
+library(tidyverse)
+library(fields)
+library(mvtnorm)
+
+df <- readRDS("county_long.rds") |> 
+      filter(TAX_YEAR < 2020) |> 
+      select(all_of(c("TAX_YEAR", "geoid_2010", "TOT_REV", "TOT_EXP", "TOT_ASSET", "county_full", "state_name", "REGION", "DIVISION", "TotDmgADJ", "n_disasters", "TotPerCapADJ", "FEMA_threshADJ")))
+
+top <- quantile(df$TotPerCapADJ, probs = c(0.99)) # will look for county,year pairs where the county had per capita damage in the top 1 percentile
+df <- df |> mutate(topDamage = TotPerCapADJ >= top)
+
+# distance matrix of years
+dist_mat_all <- as.matrix(dist(sort(unique(df$TAX_YEAR) - min(df$TAX_YEAR) + 1), diag=TRUE, upper=TRUE))
+
+init_conds <- readRDS("init_conds_50.rds")$centers
+countyID <- "21223" # "13061", "28143", "48431"
+
+my_data <- df |> filter(geoid_2010 == countyID) |>
+      mutate(TOT_REV = log1p(TOT_REV),
+             TOT_EXP = log1p(TOT_EXP),
+             TOT_ASSET = log1p(TOT_ASSET))
+# min_year <- min(my_data$TAX_YEAR)
+all_years <- my_data$TAX_YEAR - 1991 + 1 # all the years we have data for this county
+
+candidate <- (my_data  |> filter(topDamage) |> select(TAX_YEAR) |> pull()) - 1991 + 1
+left_years <- all_years[1:which(all_years == candidate)-1]
+right_years <- all_years[which(all_years == candidate):length(all_years)]
+
+log_rev <- my_data |> merge(data.frame(TAX_YEAR = 1991:2019), all = TRUE) |> arrange(TAX_YEAR) |> pull(TOT_REV)
+
+curr_all_years <- c(left_years, right_years)
+centered_rev <- log_rev[curr_all_years] - mean(log_rev[curr_all_years])
+dist_mat <- dist_mat_all[curr_all_years, curr_all_years]
+dist_mat <- (dist_mat - min(dist_mat)) / (max(dist_mat) - min(dist_mat))
+
+i <- 1
+mat_cov <- Matern(d = dist_mat, smoothness = init_conds[i,1], range = 1, phi = 1) + diag(init_conds[i,1], dim(dist_mat)[1])
+
+# Compute sigma^2
+sigma.squared <- (1/length(centered_rev)) * (centered_rev %*% chol2inv(chol(mat_cov)) %*% centered_rev)[1,1]
+
+# Compute likelihood
+likelihood <- dmvnorm(centered_rev,
+                      mean = rep(0, length(centered_rev)),
+                      sigma = sigma.squared * mat_cov,
+                      log = TRUE)
+
+centered_rev.L <- log_rev[left_years] - mean(log_rev[left_years])
+dist_mat.L <- dist_mat_all[left_years, left_years]
+dist_mat.L <- (dist_mat.L - min(dist_mat.L)) / (max(dist_mat.L) - min(dist_mat.L))
+
+centered_rev.R <- log_rev[right_years] - mean(log_rev[right_years])
+dist_mat.R <- dist_mat_all[right_years, right_years]
+dist_mat.R <- (dist_mat.R - min(dist_mat.R)) / (max(dist_mat.R) - min(dist_mat.R))
+
+mat_cov <- Matern(d = dist_mat.R, smoothness = init_conds[i,1], range = 1, phi = 1) + diag(init_conds[i,1], dim(dist_mat.R)[1])
+
+# Compute sigma^2
+sigma.squared <- (1/length(centered_rev.R)) * (centered_rev.R %*% chol2inv(chol(mat_cov)) %*% centered_rev.R)[1,1]
+
+# Compute likelihood
+likelihood <- dmvnorm(centered_rev.R,
+                      mean = rep(0, length(centered_rev.R)),
+                      sigma = sigma.squared * mat_cov,
+                      log = TRUE)
+```
+
+
+## LRT
+```{r}
+library(readr)
+library(dplyr)
+library(tidyverse)
+
+glued <- rbind(readRDS( "best_empirical_1stHalf.rds"), 
+               readRDS( "best_empirical_2ndHalf.rds"))
+
+best_all <- glued |> 
+      mutate(ID = paste0(geoid,".",trial)) |> 
+      select(-geoid,-trial)
+best_all <- split(best_all, best_all$ID)
+best_all <- lapply(best_all, function(x) {split(x,x$type)})
+
+saveRDS(best_all, "best_empirical_all.rds")
+```
+
+
+```{r}
+library(readr)
+library(dplyr)
+library(tidyverse)
+library(fields)
+library(mvtnorm)
+
+candidates_all <- readRDS("random_candidates50.rds")
+df <- readRDS("county_long.rds") |> 
+      filter(TAX_YEAR < 2020) |> 
+      select(all_of(c("TAX_YEAR", "geoid_2010", "TOT_REV", "TOT_EXP", "TOT_ASSET", "county_full", "state_name", "REGION", "DIVISION", "TotDmgADJ", "n_disasters", "TotPerCapADJ", "FEMA_threshADJ"))) |>
+      filter(geoid_2010 %in% names(candidates_all$`1`)) |>
+      arrange(geoid_2010, TAX_YEAR)
+
+# distance matrix of years
+dist_mat_all <- as.matrix(dist(sort(unique(df$TAX_YEAR) - min(df$TAX_YEAR) + 1), diag=TRUE, upper=TRUE))
+
+best_all <- readRDS("best_empirical_all.rds")
+
+rho = 1
+
+reject_null_all <- setNames(vector("list", length(candidates_all)), names(candidates_all))
+for (trialID in 1:length(candidates_all)) {
+      reject_null <- list()
+      for (countyID in unique(df$geoid_2010)){
+            ID <- paste0(countyID, ".", trialID)
+            print(ID)
+            # pull their time series
+            my_data <- df |> filter(geoid_2010 == countyID) |>
+                  mutate(TOT_REV = log1p(TOT_REV),
+                         TOT_EXP = log1p(TOT_EXP),
+                         TOT_ASSET = log1p(TOT_ASSET))
+            all_years <- my_data$TAX_YEAR - min(df$TAX_YEAR) + 1 # all the years we have data for this county
+            log_rev <- my_data |> merge(data.frame(TAX_YEAR = 1991:2019), all = TRUE) |> arrange(TAX_YEAR) |> pull(TOT_REV)
+            
+            candidate <- candidates_all[[trialID]][[countyID]] - min(df$TAX_YEAR) + 1
+            
+            # pull best parameters
+            best.curr <- best_all[[ID]] # best.curr$left$nu
+      
+            # Determine the left and right time series corresponding to the current candidate change point
+            left_years <- all_years[1:which(all_years == candidate)-1]
+            right_years <- all_years[which(all_years == candidate):length(all_years)]
+            
+            ### Null Hypothesis Model ###
+            curr_all_years <- c(left_years, right_years) # Redundant for single candidate
+            centered_rev <- log_rev[curr_all_years] - mean(log_rev[curr_all_years]) # center the log revenue values so they are mean 0
+            
+            dist_mat <- dist_mat_all[curr_all_years, curr_all_years]
+            dist_mat <- (dist_mat - min(dist_mat)) / (max(dist_mat) - min(dist_mat))
+            Sigma_0 <- Matern(d = dist_mat,
+                              smoothness = best.curr$null$nu,
+                              range = rho,
+                              phi = 1) + diag(best.curr$null$nugget, dim(dist_mat)[1])
+            
+            sigma.sqrd_0 <- (1/length(centered_rev)) * (centered_rev %*% chol2inv(chol(Sigma_0)) %*% centered_rev)[1,1]
+            Sigma_0 <- sigma.sqrd_0 * Sigma_0
+            
+            ### Alternative Hypothesis Model ###
+            # center the log revenue values so they are mean 0
+            centered_rev.L <- log_rev[left_years] - mean(log_rev[left_years])
+            centered_rev.R <- log_rev[right_years] - mean(log_rev[right_years])
+            
+            # compute and normalize distance matrices
+            dist_mat.L <- dist_mat_all[left_years, left_years]
+            dist_mat.L <- (dist_mat.L - min(dist_mat.L)) / (max(dist_mat.L) - min(dist_mat.L))
+            
+            dist_mat.R <- dist_mat_all[right_years, right_years]
+            dist_mat.R <- (dist_mat.R - min(dist_mat.R)) / (max(dist_mat.R) - min(dist_mat.R))
+            
+            # Compute Matern covariance matrices
+            Sigma_L <- Matern(d = dist_mat.L,
+                        smoothness = best.curr$left$nu,
+                        range = rho,
+                        phi = 1) + diag(best.curr$left$nugget, dim(dist_mat.L)[1])
+            sigma.sqrd_L <- (1/length(left_years)) * (centered_rev.L %*% chol2inv(chol(Sigma_L)) %*% centered_rev.L)[1,1]
+            Sigma_L <- sigma.sqrd_L * Sigma_L
+            
+            Sigma_R <- Matern(d = dist_mat.R,
+                        smoothness = best.curr$right$nu,
+                        range = rho,
+                        phi = 1) + diag(best.curr$right$nugget, dim(dist_mat.R)[1])
+            sigma.sqrd_R <- (1/length(right_years)) * (centered_rev.R %*% chol2inv(chol(Sigma_R)) %*% centered_rev.R)[1,1]
+            Sigma_R <- sigma.sqrd_R * Sigma_R
+            
+            ### Likelihood Ratio Test ###
+            L_0 <- dmvnorm(centered_rev, 
+                           mean = rep(0, length(centered_rev)), 
+                           sigma = Sigma_0,
+                           log = TRUE)
+            
+            L_left <- dmvnorm(centered_rev.L, 
+                              mean = rep(0, length(centered_rev.L)), 
+                              sigma = Sigma_L,
+                              log = TRUE)
+            
+            L_right <- dmvnorm(centered_rev.R, 
+                               mean = rep(0, length(centered_rev.R)), 
+                               sigma = Sigma_R,
+                               log = TRUE)
+            
+            L_alt <- L_left + L_right
+      
+            
+            # likelihood ratio test statistic
+            lrt <- -2*L_0 + 2*L_alt
+            doF <- 4 #  (mu1, mu2, Sigma1, Sigma2, nu1, nu2, nugget1, nugget2) vs (mu, Sigma, nu, nugget)
+            reject_null[[countyID]] <- (lrt > qchisq(p = 0.05, df = doF, lower.tail = FALSE))
+
+      }
+      reject_null_all[[as.character(trialID)]] <- reject_null
+}
+
+# res <- unlist(lapply(reject_null_all, function(x){sum(unlist(x)) / length(x)}))
+# hist(res)
+# sd(res)
+```
+
+bootstrapping
+```{r}
+library(doParallel)
+
+res <- unlist(unname(reject_null_all))
+res <- split(res, names(res))
+res <- lapply (res, unname)
+
+empirical <- foreach(i = 1:1000, .inorder = FALSE) %do% {
+      tst <- lapply(res, function(x){sample(x, 1)})
+      sum(unlist(tst)) / length(tst)
+}
+
+hist(unlist(empirical))
+quantile(unlist(empirical), probs = c(0.025, 0.5, 0.975)) # middle 95% of data is between 50.54% and 58.49%
+mean(unlist(empirical))
+```
+
+
+```{r}
+library(readr)
+library(dplyr)
+library(tidyverse)
+library(fields)
+library(mvtnorm)
+
+candidates_all <- readRDS("random_candidates50.rds")
+df <- readRDS("county_long.rds") |> 
+      filter(TAX_YEAR < 2020) |> 
+      select(all_of(c("TAX_YEAR", "geoid_2010", "TOT_REV", "TOT_EXP", "TOT_ASSET", "county_full", "state_name", "REGION", "DIVISION", "TotDmgADJ", "n_disasters", "TotPerCapADJ", "FEMA_threshADJ"))) |>
+      filter(geoid_2010 %in% names(candidates_all$`1`)) |>
+      arrange(geoid_2010, TAX_YEAR)
+
+# distance matrix of years
+dist_mat_all <- as.matrix(dist(sort(unique(df$TAX_YEAR) - min(df$TAX_YEAR) + 1), diag=TRUE, upper=TRUE))
+
+best_all <- readRDS("empirical_best_test.rds") 
+combos <- expand.grid(unique(best_all$geoid), unique(best_all$trial)) |> arrange(Var1, Var2)
+reject_null <- setNames(vector("list", length(unique(best_all$trial))), unique(best_all$trial))
+reject_null <- lapply(reject_null, function(x){
+      setNames(vector("list", length(unique(best_all$geoid))), unique(best_all$geoid))
+      })
+
+best_all <- best_all |> 
+      mutate(ID = paste0(geoid,".",trial)) |> 
+      select(-geoid,-trial)
+best_all <- split(best_all, best_all$ID)
+best_all <- lapply(best_all, function(x) {split(x,x$type)})
+
+rho = 1
+
+# combos <- expand.grid(unique(df$geoid_2010), as.character(1:length(candidates_all))) |> arrange(Var1, Var2)
+for (i in nrow(combos)) {
+      countyID <- combos$Var1[i]
+      trialID <- combos$Var2[i]
+      ID <- paste0(countyID, ".", trialID)
+      print(ID)
+      # pull their time series
+      my_data <- df |> filter(geoid_2010 == countyID) |>
+            mutate(TOT_REV = log1p(TOT_REV),
+                   TOT_EXP = log1p(TOT_EXP),
+                   TOT_ASSET = log1p(TOT_ASSET))
+      all_years <- my_data$TAX_YEAR - min(df$TAX_YEAR) + 1 # all the years we have data for this county
+      log_rev <- my_data |> merge(data.frame(TAX_YEAR = 1991:2019), all = TRUE) |> arrange(TAX_YEAR) |> pull(TOT_REV)
+      
+      candidate <- candidates_all[[trialID]][[countyID]] - min(df$TAX_YEAR) + 1
+      
+      # pull best parameters
+      best.curr <- best_all[[ID]] # best.curr$left$nu
+
+      # Determine the left and right time series corresponding to the current candidate change point
+      left_years <- all_years[1:which(all_years == candidate)-1]
+      right_years <- all_years[which(all_years == candidate):length(all_years)]
+      
+      ### Null Hypothesis Model ###
+      curr_all_years <- c(left_years, right_years) # Redundant for single candidate
+      centered_rev <- log_rev[curr_all_years] - mean(log_rev[curr_all_years]) # center the log revenue values so they are mean 0
+      
+      dist_mat <- dist_mat_all[curr_all_years, curr_all_years]
+      dist_mat <- (dist_mat - min(dist_mat)) / (max(dist_mat) - min(dist_mat))
+      Sigma_0 <- Matern(d = dist_mat,
+                        smoothness = best.curr$null$nu,
+                        range = rho,
+                        phi = 1) + diag(best.curr$null$nugget, dim(dist_mat)[1])
+      
+      sigma.sqrd_0 <- (1/length(centered_rev)) * (centered_rev %*% chol2inv(chol(Sigma_0)) %*% centered_rev)[1,1]
+      Sigma_0 <- sigma.sqrd_0 * Sigma_0
+      
+      ### Alternative Hypothesis Model ###
+      # center the log revenue values so they are mean 0
+      centered_rev.L <- log_rev[left_years] - mean(log_rev[left_years])
+      centered_rev.R <- log_rev[right_years] - mean(log_rev[right_years])
+      
+      # compute and normalize distance matrices
+      dist_mat.L <- dist_mat_all[left_years, left_years]
+      dist_mat.L <- (dist_mat.L - min(dist_mat.L)) / (max(dist_mat.L) - min(dist_mat.L))
+      
+      dist_mat.R <- dist_mat_all[right_years, right_years]
+      dist_mat.R <- (dist_mat.R - min(dist_mat.R)) / (max(dist_mat.R) - min(dist_mat.R))
+      
+      # Compute Matern covariance matrices
+      Sigma_L <- Matern(d = dist_mat.L,
+                  smoothness = best.curr$left$nu,
+                  range = rho,
+                  phi = 1) + diag(best.curr$left$nugget, dim(dist_mat.L)[1])
+      sigma.sqrd_L <- (1/length(left_years)) * (centered_rev.L %*% chol2inv(chol(Sigma_L)) %*% centered_rev.L)[1,1]
+      Sigma_L <- sigma.sqrd_L * Sigma_L
+      
+      Sigma_R <- Matern(d = dist_mat.R,
+                  smoothness = best.curr$right$nu,
+                  range = rho,
+                  phi = 1) + diag(best.curr$right$nugget, dim(dist_mat.R)[1])
+      sigma.sqrd_R <- (1/length(right_years)) * (centered_rev.R %*% chol2inv(chol(Sigma_R)) %*% centered_rev.R)[1,1]
+      Sigma_R <- sigma.sqrd_R * Sigma_R
+      
+      ### Likelihood Ratio Test ###
+      L_0 <- dmvnorm(centered_rev, 
+                     mean = rep(0, length(centered_rev)), 
+                     sigma = Sigma_0,
+                     log = TRUE)
+      
+      L_left <- dmvnorm(centered_rev.L, 
+                        mean = rep(0, length(centered_rev.L)), 
+                        sigma = Sigma_L,
+                        log = TRUE)
+      
+      L_right <- dmvnorm(centered_rev.R, 
+                         mean = rep(0, length(centered_rev.R)), 
+                         sigma = Sigma_R,
+                         log = TRUE)
+      
+      L_alt <- L_left + L_right
+
+      
+      # likelihood ratio test statistic
+      lrt <- -2*L_0 + 2*L_alt
+      doF <- 4 #  (mu1, mu2, Sigma1, Sigma2, nu1, nu2, nugget1, nugget2) vs (mu, Sigma, nu, nugget)
+      print(reject_null[[trialID]][[countyID]])
+      reject_null[[trialID]][[countyID]] <- (lrt > qchisq(p = 0.05, df = doF, lower.tail = FALSE))
+      print(reject_null[[trialID]][[countyID]])
+}
+
+
+# sum(unlist(reject_null)) / length(reject_null) # 52.71%
+```
+
+
