@@ -10,6 +10,8 @@ knitr::opts_chunk$set(echo = FALSE, eval = FALSE)
 ```
 
 # Downloading Data
+Note: This project uses the harmonized/core/ (pre-tier layout) of the NCCS Core Files, which is now deprecated. 
+This is because the file were downloaded in 2024 prior to the new tier system. 
 ```{r}
 source("SCRIPTS/download_data.R")
 tscope_values <- c("501c3") # Download files from Tax Exempt Types in this list; possible values: "501c3", "501ce" 
