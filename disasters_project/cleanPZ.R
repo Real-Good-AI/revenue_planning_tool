@@ -23,7 +23,7 @@ year_values <- seq(from = 1991, to = 2021, by = 1)
 pz_type <- "C3-CHARITIES" # SPECIFIC TO PZ TYPE; options are "C3-CHARITIES" or "CE-NONPROFIT"
 for (year in year_values){
       # Get data, restrict to variables we care about, remove records that are exact duplicates, and make EIN2 the first column
-      file_name <- paste0("CORE/pz/CORE-", year, "-501", pz_type, "-PZ-HRMN.csv")
+      file_name <- paste0("data/pz/CORE-", year, "-501", pz_type, "-PZ-HRMN.csv")
       
       # load data into environment 
       temp <- as.data.table(read_csv(file_name, show_col_types = FALSE))
@@ -36,7 +36,7 @@ for (year in year_values){
 }
 
 # Status of missing variables
-source("SCRIPTS/clean_helper.R")
+source("../SCRIPTS/clean_helper.R")
 dt.na_counts <- na_counts_df(dt.original)
 
 # There are two variables for revenue and expenses but each point to the same information in theory
@@ -158,7 +158,7 @@ library(data.table)
 library(readr)
 
 dt <- readRDS("data/pz_merged.rds") # SPECIFIC TO PZ TYPE; options are "data/pz_merged.rds" or "data/pz_ce_merged.rds"
-bmf <- readRDS("cleanBMF.rds")
+bmf <- readRDS("data/cleanBMF.rds")
 
 # 1. Get all the records from organizations whose EIN is missing from bmf
 # Use the `key_col` as the join key and perform an anti-join
@@ -183,7 +183,7 @@ library(data.table)
 library(readr)
 library(dplyr)
 
-merged.dt <- readRDS("pz_merged_bmf.rds") # SPECIFIC TO PZ TYPE; options are "pz_merged_bmf.rds" or "pz_ce_merged_bmf.rds"
+merged.dt <- readRDS("data/pz_merged_bmf.rds") # SPECIFIC TO PZ TYPE; options are "pz_merged_bmf.rds" or "pz_ce_merged_bmf.rds"
 
 # Remove any orgs from state codes above 56 (because they don't correspond to actual states)
 merged.dt <- merged.dt |> mutate(state.FIPS = as.integer(state.FIPS)) |> filter(state.FIPS <= 56)
@@ -198,4 +198,4 @@ setnames(merged.dt,
 
 merged.dt[, na_count := NULL]
 
-saveRDS(merged.dt, "pz_processed.rds") # SPECIFIC TO PZ TYPE; options are "pz_processed.rds" or "pz_ce_processed.rds"
+# saveRDS(merged.dt, "data/pz_processed.rds") # SPECIFIC TO PZ TYPE; options are "pz_processed.rds" or "pz_ce_processed.rds"; uncomment this line of code to save the file

@@ -1,5 +1,6 @@
 library(data.table)
 library(readr)
+library(dplyr)
 
 ######### Download and stack the data #########
 vars.keep <- c("EIN2", "TAX_YEAR", "PF_02_ASSET_TOT_EOY_BV", "PF_01_REV_TOT_BOOKS", "PF_01_EXP_TOT_EXP_DISBMT_BOOKS")
@@ -13,7 +14,7 @@ colnames(dt) <- vars.keep
 year_values <- seq(from = 1991, to = 2021, by = 1)
 for (year in year_values){
       # Get data, restrict to variables we care about, remove records that are exact duplicates, and make EIN2 the first column
-      file_name <- sprintf("../CORE/pf/CORE-%s-501C3-PRIVFOUND-PF-HRMN-V0.csv", year)
+      file_name <- sprintf("data/pf/CORE-%s-501C3-PRIVFOUND-PF-HRMN-V0.csv", year)
       
       # load data into environment 
       temp <- as.data.table(read_csv(file_name, show_col_types = FALSE))
@@ -123,10 +124,10 @@ table(dups$TAX_YEAR) # pretty steady across years, I would say 1993, 2016, and 2
 
 # saveRDS(dt, "pf_merged.rds")
 
-rm(dt.na_counts, dt.original, dup_groups, gt1000_summary, insignificant_groups)
+rm(dt.original, dup_groups, gt1000_summary, insignificant_groups)
 
 ########## Merge with BMF File ##########
-bmf <- readRDS("cleanBMF.rds")
+bmf <- readRDS("data/cleanBMF.rds")
 
 # 1. Get all the records from organizations whose EIN is missing from bmf
 # Use the `key_col` as the join key and perform an anti-join
@@ -156,4 +157,4 @@ merged.dt[EIN2=="EIN-38-3737079", county.census.geoid := "02261"]
 merged.dt[EIN2=="EIN-83-3967403", county.census.geoid := "02261"]
 
 
-# saveRDS(merged.dt, "pf_processed.rds") #2,087,387 from 188,922 unique orgs; uncomment this line of code to save the file
+# saveRDS(merged.dt, "data/pf_processed.rds") #2,087,387 from 188,922 unique orgs; uncomment this line of code to save the file
