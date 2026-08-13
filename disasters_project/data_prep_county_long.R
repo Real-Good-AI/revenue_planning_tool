@@ -25,11 +25,6 @@ df <- df |> mutate(TOT_ASSET_OG = TOT_ASSET,
 # Optional, just to keep minimal number of columns
 df <- df |> select(-TOT_ASSET_OG, -TOT_REV_OG, -TOT_EXP_OG, -DATA_COUNT)
 
-# July 14, 2026: if negative, convert to 0
-df <- df |> mutate(TOT_REV = ifelse(TOT_REV < 0, 0, TOT_REV),
-                   TOT_ASSET = ifelse(TOT_ASSET < 0, 0, TOT_ASSET),
-                   TOT_EXP = ifelse(TOT_EXP < 0, 0, TOT_EXP))
-
 # Split up NTEEV2 into 14 dummy variables (12 categories, 1 unknown category, 1 missing category)
 ntee <- df |> 
       select(EIN2, NTEEV2, TAX_YEAR, county.census.geoid) |>
@@ -172,7 +167,7 @@ rm(census_df, dt, lag_years, result)
 #################################################################################################
 # Disaster Data 
 #################################################################################################
-disasters <- readRDS("disasters.rds")
+disasters <- readRDS("data/disasters.rds")
 
 disasters <- merge(disasters, adj2019, by.x = "TAX_YEAR", by.y = "YEAR")
 disasters <- disasters |>  mutate(TotDmg = CropDmg_TOT + PropertyDmg_TOT,
@@ -205,27 +200,5 @@ df <- df |> mutate(total_population = as.numeric(total_population),
                    TotPerCapADJ = TotDmgADJ/total_population,
                    treat.FEMA = as.numeric(TotPerCapADJ >= FEMA_threshADJ))
 
-# The following can be used to define different treatment indicators based on data quantiles
-# quartiles_df <- df |> group_by(TAX_YEAR) |>
-#       summarise(top_25 = quantile(TotPerCapADJ, 0.75, na.rm = TRUE),
-#                 bot_50 = quantile(TotPerCapADJ, 0.50, na.rm = TRUE),
-#                 top_10 = quantile(TotPerCapADJ, 0.9, na.rm = TRUE))
-# 
-# df <- merge(df, quartiles_df, by = "TAX_YEAR")
-# 
-# df <- df |> mutate(in.top25 = TotPerCapADJ >= top_25,
-#                    in.bot50 = TotPerCapADJ <= bot_50,
-#                    in.top10 = TotPerCapADJ >= top_10,
-#                    treat.top25 = case_when(
-#                          in.top25 ~ 1,
-#                          in.bot50 ~ 0,
-#                          .default = NA),
-#                    treat.top90 = case_when(
-#                          in.top10 ~ 1,
-#                          in.bot50 ~ 0,
-#                          .default = NA),
-#                    )
-
-# 
-# saveRDS(df, "county_long.rds")
+# saveRDS(df, "data/county_long.rds")
 
