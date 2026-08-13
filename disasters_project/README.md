@@ -59,4 +59,10 @@ CITATION: CEMHS, 2026. Spatial Hazard Events and Losses Database for the United 
 Finally, to build the county-year panel that aggregates nonprofit data at the county level, you will need to run `data_prep_county_long.R`.
 You will need to uncomment the last line of code to save the result. This should produce the file `county_long.rds` in the `data/` directory.
 
+## Two Distinct Approaches
+The directories `causal_approach/` and `gp_approach/` each contain data processing and analysis files specific to the corresponding approach. While most of the data cleaning and processing was identical, each approach required certain small adjustments for different reasons. 
+Thus, there are some minor additional data cleaning or processing steps within each folder. 
 
+For `gp_approach/`, begin with the file `county_level_analysis.Rmd`. 
+After finishing the county-level analysis, you may continue with `org_level_analysis.Rmd`.
+Files produced in these scripts should be saved to a directory called `gp_data/`.
