@@ -1,24 +1,22 @@
 library(data.table)
 library(readr)
+library(dplyr)
 
 pf <- readRDS("data/pf_processed.rds")
 pz <- readRDS("data/pz_processed.rds")
 pz.ce <- readRDS("data/pz_ce_processed.rds")
 
-# Keep only assets, rev, and expenses variables for private foundations to match PZ
-pf <- pf[, !c("PF_01_REV_GRO_PROFIT_BOOKS", "PF_02_LIAB_TOT_EOY_BV", "PF_01_EXP_CONTR_PAID_BOOKS", "PF_01_EXP_TOT_EXP_DISBMT_DISBMT"), with = FALSE]
+# remove FLAG column because unused
+pz <- pz[, !c("FLAG"), with = FALSE]
+pz.ce <- pz.ce[, !c("FLAG"), with = FALSE]
 
 # rename relevant columns
 setnames(pf,
-         old = c("PF_02_ASSET_TOT_EOY_BV", "PF_01_REV_TOT_BOOKS", "PF_01_EXP_TOT_EXP_DISBMT_BOOKS", "F990_TOTAL_ASSETS_RECENT"),
-         new = c("TOT_ASSET", "TOT_REV", "TOT_EXP", "SIZE"))
-
-pf[, SOURCE := "PF"]
-pz[, SOURCE := "PZ"]
-pz.ce[, SOURCE := "PZ.CE"]
+         old = c("PF_02_ASSET_TOT_EOY_BV", "PF_01_REV_TOT_BOOKS", "PF_01_EXP_TOT_EXP_DISBMT_BOOKS"),
+         new = c("TOT_ASSET", "TOT_REV", "TOT_EXP"))
 
 dt <- rbindlist(list(pf, pz, pz.ce), use.names = TRUE)
-dt <- unique(dt)
+dt <- distinct(dt)
 
 rm(pf, pz, pz.ce)
 
@@ -34,9 +32,9 @@ diagnostics <- dups[, compare_pair_dt(.SD, dollar_cols), by = .(EIN2, TAX_YEAR)]
 probs <- seq(0,1,0.1)
 quantile(diagnostics$max_abs_diff, probs = probs)
 
-# There are 370 (EIN2, TAX_YEAR) pairs where the records are exact duplicates EXCEPT in the source column... how to deal with?
+# Final dupe counts: 30,684 org,year unresolved pairs
 
 dt[, DATA_COUNT := .N, by = c("EIN2")] #recalculate because now may have from different sources... but will be overcount because of duplicates
 quantile(dt$DATA_COUNT, probs = probs)
 
-# saveRDS(dt, "data/mega.rds") # uncomment this line of code to save the file
+saveRDS(dt, "data/mega.rds") # 14,432,124 records, 1,284,073 orgs
