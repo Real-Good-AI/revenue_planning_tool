@@ -5,7 +5,7 @@ library(readr)
 library(dplyr)
 library(tidyverse)
 
-file_name <- "sheldus/direct_loss_aggregated_output_28975.csv" # THIS MUST BE CHANGED ACCORDING TO THE SHELDUS DATA YOU DOWNLOAD
+file_name <- "data/direct_loss_aggregated_output_28975.csv" # THIS MUST BE CHANGED ACCORDING TO THE SHELDUS DATA YOU DOWNLOAD
 disasters <- as.data.table(read_csv(file_name, show_col_types = FALSE)) |>
       select(StateName, CountyName, County_FIPS, Year, Hazard, CropDmg, `CropDmg(ADJ 2021)`, PropertyDmg, `PropertyDmg(ADJ 2021)`)
 
@@ -19,13 +19,6 @@ setnames(disasters,
 
 # Manually fix possible FIPS code conflicts
 disasters <- disasters |> mutate(fips_changes = county.geoid)
-
-df.counties <- df$geoid_2010
-dis.ids <- unique(disasters$county.geoid)
-setdiff(df.counties, dis.ids)
-tmp <- setdiff(dis.ids, df.counties)
-
-# disasters |> filter(county.geoid %in% tmp)
 
 disasters$fips_changes[disasters$county.geoid == "02158"] <- "02270" # 02270 got new FIPS 02158 in 2015
 disasters$fips_changes[disasters$county.geoid == "46102"] <- "46113" # 46113 got new FIPS 46102 in 2015
@@ -47,20 +40,6 @@ dups2 <- disasters[dup_groups2, on = key_var]
 # We can safely remove the records where CountyName begins with an asterick because those are "historical" counties that no longer exist
 dups <- dups2[substr(CountyName, 1, 1) == "*"]
 disasters <- fsetdiff(disasters, dups[, !c("N"), with = FALSE])
-
-# for testing?
-# df.counties <- df$geoid_2010
-# dis.ids.new <- unique(disasters$fips_changes)
-# setdiff(df.counties, dis.ids)
-# setdiff(df.counties, dis.ids.new)
-# 
-# setdiff(dis.ids, df.counties)
-# setdiff(dis.ids.new, df.counties)
-# setdiff(setdiff(dis.ids, df.counties), setdiff(dis.ids.new, df.counties))
-# 
-# merge(df, disasters,
-#       by.x = c('geoid_2010', 'TAX_YEAR'),
-#       by.y = c('fips_changes', 'TAX_YEAR'), all.x = TRUE)
 
 # Collapse to a per-county-per-year dataset
 disasters <- disasters |> 
