@@ -48,7 +48,8 @@ Helper functions used throughout the repo
 * download_data.R
   * `downloadCORE()`: download CORE files from NCCS site
   * `download_dicts()`: download data dictionaries from NCCS site
-  * `download_bmf()`: download Unified BMF file from NCCS site **UPDATE 2026**: This function no longer works! To download the raw BMF file for reproducibility purposes, please download from [this Google Drive link](https://drive.google.com/file/d/1FYf_TSUtSwUj5_1990PtaXcuNRQhhl8G/view?usp=sharing).
+  * `download_bmf()`: download Unified BMF file from NCCS site
+    * **UPDATE 2026**: This function no longer works! To download the raw BMF file for reproducibility purposes, please download from [this Google Drive link](https://drive.google.com/file/d/1FYf_TSUtSwUj5_1990PtaXcuNRQhhl8G/view?usp=sharing).
 * imputation_GP.R
   * This is the script used to impute missing values in the mega dataset
   * See preprocessing.Rmd Section "Preprocessing", subsection "Creating "Full" Dataset" for more details
