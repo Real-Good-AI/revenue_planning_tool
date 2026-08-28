@@ -47,7 +47,7 @@ Helper functions used throughout the repo
 * download_data.R
   * `downloadCORE()`: download CORE files from NCCS site
   * `download_dicts()`: download data dictionaries from NCCS site
-  * `download_bmf()`: download Unified BMF file from NCCS site
+  * `download_bmf()`: download Unified BMF file from NCCS site **UPDATE 2026**: This function no longer works! To download the raw BMF file for reproducibility purposes, please download from [this Google Drive link](https://drive.google.com/file/d/1FYf_TSUtSwUj5_1990PtaXcuNRQhhl8G/view?usp=sharing).
 * imputation_GP.R
   * This is the script used to impute missing values in the mega dataset
   * See preprocessing.Rmd Section "Preprocessing", subsection "Creating "Full" Dataset" for more details
@@ -67,3 +67,8 @@ Helper functions used throughout the repo
 * reviewing_duplicate_EIN.R
   * this contains two helpder functions for the data cleaning stage, related to identifying and analyzing duplicated records (in particular, there were times when there were multiple records for an EIN in the BMF file or for one year, so we had to resolve those duplicates)
   * for examples on how these were used, refer to preprocessing.Rmd section "Cleaning: Checking for duplicates""
+
+## REAL Rating
+ChatGPT was used heavily for code tasks throughout. Code was always carefully checked and tested.
+
+![REAL Rating Level 4](real-rating.png)
