@@ -42,4 +42,13 @@ SCRATCHWORK/counties_data/
 SCRATCHWORK/sheldus/
 SCRATCHWORK/climate_data/
 SCRATCHWORK/CORE/
+SCRATCHWORK/decDATA
+SCRATCHWORK/estimates
+SCRATCHWORK/figures
+SCRATCHWORK/misc_analysis
+SCRATCHWORK/NewDirection
+SCRATCHWORK/panel_data
+SCRATCHWORK/svc_plots
 .RDataTmp*
+disasters_project/
+app/rsconnect/documents/revenue-app.R/shinyapps.io/mec-rgai/revenue-app.dcf
