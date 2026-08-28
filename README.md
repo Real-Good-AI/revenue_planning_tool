@@ -1,6 +1,7 @@
 # Nonprofit Revenue Prediction Tool
 
-Note: Data is from open source NCCS Core Series Data: [website link](https://nccs.urban.org/nccs/datasets/core/) 
+**NOTE**: This project uses the harmonized/core/ (pre-tier layout) of the [National Center for Charity Statistics (NCCS) Core Files](https://nccs.urban.org/nccs/datasets/core/), which is now deprecated. 
+This is because the files were downloaded in 2025 prior to the new tier system, which launched in 2026. However, the code for downloading the data files should still work. Again, just beware that you are downloading an old version of files in order to reproduce our results.
 
 Data Citation: Jesse Lecy, (2024). NCCS Core Series.
 
