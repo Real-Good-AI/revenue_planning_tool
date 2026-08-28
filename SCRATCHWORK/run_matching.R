@@ -9,11 +9,11 @@ library(doParallel)
 source("matches_helper.R")
 rm(add_exposed, add_SVC, create_adj_list, no_int_no_SVC_plots, tidy_bal_df)
 
-refine_methods <- c("none", "ps.match", "CBPS.match", "ps.weight", "CBPS.weight")
-# refine_methods <- c("mahalanobis")
+# refine_methods <- c("none", "ps.match", "CBPS.match", "ps.weight", "CBPS.weight")
+refine_methods <- c("none")
 save_methods <- list("none" = "no_match", "mahalanobis" = "maha_match", "ps.match" = "ps_match", "CBPS.match" = "CBPS_match", "ps.weight" = "ps_weight", "CBPS.weight" = "CBPS_weight")
 matching_flags <- list("none" = FALSE, "mahalanobis" = TRUE, "ps.match" = TRUE, "CBPS.match" = TRUE, "ps.weight" = TRUE, "CBPS.weight" = TRUE)
-lags <- c(3) # Pena et al paper uses up to lag = 3 so we will too
+lags <- c(1) # Pena et al paper uses up to lag = 3 so we will too
 
 no_interference_model_list <- list(
       # list("full_path" = "no_svc/no_int_panelV1/config2/",
@@ -28,6 +28,11 @@ no_interference_model_list <- list(
       #      "data" = "panel_data/no_int_panelV3.rds",
       #      "match_on_NA" = FALSE,
       #      "svc_flag" = TRUE)
+      list("full_path" = "misc_analysis/no_int_none_L1_",
+           "data" = "panel_data/no_int_panelV2.rds",
+           "match_on_NA" = FALSE,
+           "svc_flag" = FALSE,
+           "J" = 20)
 )
 
 interference_model_list <- list(
@@ -38,7 +43,8 @@ interference_model_list <- list(
       # list("full_path" = "with_svc/int_panelV2/config3/",
       #      "data" = "panel_data/int_panelV2.rds",
       #      "match_on_NA" = FALSE,
-      #      "svc_flag" = TRUE),
+      #      "svc_flag" = TRUE,
+      #      "J" = 20)
       # list("full_path" = "with_svc/int_panelV3/config4/",
       #      "data" = "panel_data/int_panelV3.rds",
       #      "match_on_NA" = FALSE,
@@ -47,26 +53,31 @@ interference_model_list <- list(
       #      "data" = "panel_data/int_panelV1.rds",
       #      "match_on_NA" = FALSE,
       #      "svc_flag" = FALSE)
-      list("full_path" = "misc_analysis/dist00_",
-           "data" = "panel_data/int_panel_d00.rds",
+      # list("full_path" = "misc_analysis/dist00_",
+      #      "data" = "panel_data/int_panel_d00.rds",
+      #      "match_on_NA" = FALSE,
+      #      "svc_flag" = TRUE,
+      #      "J" = 20),
+      # list("full_path" = "misc_analysis/dist50_",
+      #      "data" = "panel_data/int_panel_d50.rds",
+      #      "match_on_NA" = FALSE,
+      #      "svc_flag" = TRUE,
+      #      "J" = 20),
+      # list("full_path" = "misc_analysis/int_svc_C3_J5_",
+      #      "data" = "panel_data/int_panelV2.rds",
+      #      "match_on_NA" = FALSE,
+      #      "svc_flag" = TRUE,
+      #      "J" = 5),
+      # list("full_path" = "misc_analysis/int_svc_C3_J50_",
+      #      "data" = "panel_data/int_panelV2.rds",
+      #      "match_on_NA" = FALSE,
+      #      "svc_flag" = TRUE,
+      #      "J" = 50)
+      list("full_path" = "misc_analysis/int_none_L1_",
+           "data" = "panel_data/int_panelV1.rds",
            "match_on_NA" = FALSE,
-           "svc_flag" = TRUE,
-           "J" = 20),
-      list("full_path" = "misc_analysis/dist50_",
-           "data" = "panel_data/int_panel_d50.rds",
-           "match_on_NA" = FALSE,
-           "svc_flag" = TRUE,
-           "J" = 20),
-      list("full_path" = "misc_analysis/int_svc_C3_J5_",
-           "data" = "panel_data/int_panelV2.rds",
-           "match_on_NA" = FALSE,
-           "svc_flag" = TRUE,
-           "J" = 5),
-      list("full_path" = "misc_analysis/int_svc_C3_J50_",
-           "data" = "panel_data/int_panelV2.rds",
-           "match_on_NA" = FALSE,
-           "svc_flag" = TRUE,
-           "J" = 50)
+           "svc_flag" = FALSE,
+           "J" = 20)
 )
 
 cat("\n",paste(as.character(Sys.Date())), file = "run_matching_times.txt", append = TRUE)
